@@ -1,6 +1,7 @@
 # biglib
 
 C++17 以降に対応する、標準ライブラリだけで利用可能な C++ ヘッダーオンリーライブラリ。
+最大重みマッチングは整数の総重みに `__int128` を使うため、GCC / Clang が対象。
 
 ## ライブラリ一覧
 
@@ -9,6 +10,7 @@ C++17 以降に対応する、標準ライブラリだけで利用可能な C++ 
 | 線形計画・混合整数計画問題 | [mip.hpp](mip/mip.hpp) | [使い方](mip/README.md) |
 | 一般化割当問題 | [generalized_assignment.hpp](generalized_assignment/generalized_assignment.hpp) | [使い方](generalized_assignment/README.md) |
 | 非対称巡回セールスマン問題 | [asymmetric_tsp.hpp](asymmetric_tsp/asymmetric_tsp.hpp) | [使い方](asymmetric_tsp/README.md) |
+| 一般グラフの最大重みマッチング | [maximum_weight_matching.hpp](maximum_weight_matching/maximum_weight_matching.hpp) | [使い方](maximum_weight_matching/README.md) |
 
 ## 使い方
 
