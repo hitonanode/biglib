@@ -1,0 +1,35 @@
+# biglib
+
+C++17 以降に対応する、標準ライブラリだけで利用可能な C++ ヘッダーオンリーライブラリ。
+
+## ライブラリ一覧
+
+| 分野 | ヘッダー | ドキュメント |
+| --- | --- | --- |
+| 線形計画・混合整数計画問題 | [mip.hpp](mip/mip.hpp) | [使い方](mip/README.md) |
+| 一般化割当問題 | [generalized_assignment.hpp](generalized_assignment/generalized_assignment.hpp) | [使い方](generalized_assignment/README.md) |
+| 非対称巡回セールスマン問題 | [asymmetric_tsp.hpp](asymmetric_tsp/asymmetric_tsp.hpp) | [使い方](asymmetric_tsp/README.md) |
+
+## 使い方
+
+このリポジトリのルートをインクルード検索パスに追加する。
+
+```sh
+c++ -std=c++17 -O2 -I /path/to/biglib main.cpp -o main
+```
+
+各ヘッダーは単独で使え、必要なファイルの内容を提出コードへ貼り付けることもできる。
+ヘッダーをソースと同じディレクトリに置く場合、`-I` の指定は不要。
+
+## 構成
+
+ヘッダーと同名のディレクトリに、`.hpp`、`README.md`、使用例の `.cpp` を配置する。
+
+## コード整形
+
+[.clang-format](.clang-format) の設定で clang-format を使用する。
+
+```sh
+make format        # .hpp / .cpp を整形
+make format-check  # 整形済みか確認
+```
