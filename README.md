@@ -1,7 +1,7 @@
 # biglib
 
 C++17 以降に対応する、標準ライブラリだけで利用可能な C++ ヘッダーオンリーライブラリ。
-最大重みマッチングは整数の総重みに `__int128` を使うため、GCC / Clang が対象。
+最大重みマッチングとシュタイナー木は整数の総重み・費用に `__int128` を使うため、GCC / Clang が対象。
 
 ## ライブラリ一覧
 
@@ -12,6 +12,9 @@ C++17 以降に対応する、標準ライブラリだけで利用可能な C++ 
 | 対称巡回セールスマン問題 | [symmetric_tsp.hpp](symmetric_tsp/symmetric_tsp.hpp) | [使い方](symmetric_tsp/README.md) |
 | 非対称巡回セールスマン問題 | [asymmetric_tsp.hpp](asymmetric_tsp/asymmetric_tsp.hpp) | [使い方](asymmetric_tsp/README.md) |
 | 一般グラフの最大重みマッチング | [maximum_weight_matching.hpp](maximum_weight_matching/maximum_weight_matching.hpp) | [使い方](maximum_weight_matching/README.md) |
+| 最小シュタイナー木 | [steiner_tree.hpp](steiner_tree/steiner_tree.hpp) | [使い方](steiner_tree/README.md) |
+| 重み付き集合被覆・集合分割 | [set_cover_partition.hpp](set_cover_partition/set_cover_partition.hpp) | [使い方](set_cover_partition/README.md) |
+| 二次割当問題 | [quadratic_assignment.hpp](quadratic_assignment/quadratic_assignment.hpp) | [使い方](quadratic_assignment/README.md) |
 
 ## 使い方
 
