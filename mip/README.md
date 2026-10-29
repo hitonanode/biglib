@@ -2,7 +2,7 @@
 
 **[mip.hpp](mip.hpp) だけで動く C++17 のヘッダオンリー実装。** 標準ライブラリだけで利用できる。ファイル全体を提出コードの先頭に貼り付けられる。
 
-連続・整数・0/1 変数、変数の上下限、自由変数、`<=` / `>=` / `==`、最大化・最小化に対応する。小〜中規模の LP・MIP を対象にした密行列ソルバーで、AHC での時間制限・暫定解の利用、LP・MIP の繰り返し再最適化もできる。
+連続・整数・0/1 変数、変数の上下限、自由変数、`<=` / `>=` / `==`、最大化・最小化に対応する。小〜中規模の LP・MIP を対象にした疎密適応型ソルバーで、AHC での時間制限・暫定解の利用、LP・MIP の繰り返し再最適化もできる。
 
 ## 最初の例
 
@@ -84,7 +84,7 @@ r = m.solve(o);                  // 保存した根基底から再最適化
 
 保存対象はカット・分枝を加える前の最適な根。探索木、擬似コスト、カット、整数暫定解は次の呼び出しへ自動では持ち越さない。暫定解を再利用する場合は上のように検査して `initial_solution` を設定する。無効な初期解は例外となる。
 
-変数追加・目的関数再設定は保存基底を破棄する。前処理・スケーリング・自動双対化・数値許容誤差・整数緩和の設定が変わった場合も作り直す。`o.reuse_root=false` で保存・再利用を無効化でき、`m.clear_root_cache()` で保存用メモリを解放できる。連続 LP でも主問題の根は保存するが、自動双対化で解いた結果はこのキャッシュの対象外。
+変数追加・目的関数再設定は保存基底を破棄する。前処理（等式消去を含む）・スケーリング・自動双対化・有界変数・疎密表現・数値許容誤差・整数緩和の設定が変わった場合も作り直す。`o.reuse_root=false` で保存・再利用を無効化でき、`m.clear_root_cache()` で保存用メモリを解放できる。連続 LP でも主問題の根は保存するが、自動双対化で解いた結果はこのキャッシュの対象外。
 
 再利用時は古い前処理の変数対応を維持するため、追加制約による新たな固定変数消去や境界伝播は行わない。根の pivot が減っても探索全体が速くなるとは限らず、制約が大きく変わる場合は `clear_root_cache()` して再度前処理する選択肢もある。
 
@@ -96,7 +96,7 @@ r = m.solve(o);                  // 保存した根基底から再最適化
 cpopt::Options o;
 o.time_limit = 1.8;                  // solve() 内の経過秒
 o.node_limit = 100000;
-o.iteration_limit = 1000000;          // strong branching やカットも含む総 pivot 数
+o.iteration_limit = 1000000;          // strong branching やカットも含む総 pivot 数（基底交換を伴わない上下限間の移動も含む）
 o.initial_solution = known_solution; // 任意。元の変数順の実行可能解
 auto r = m.solve(o);
 if (r.has_solution) {
@@ -127,7 +127,7 @@ if (r.has_solution) {
 | `Infeasible` | 実行可能解なし |
 | `Unbounded` | LP の目的値が非有界 |
 | `Limit` | 時間・ノード・反復の上限。暫定解の有無は別に確認 |
-| `NumericalError` | 数値的な不整合を検出。この場合の `best_bound` は証明に使わない |
+| `NumericalError` | 数値的な不整合を検出。検査済みの暫定解は保持し、`best_bound` は最大化で +inf、最小化で -inf |
 | `RelaxationUnbounded` | MIP の根 LP が非有界。MIP 自体の実行可能性・非有界性は未判定 |
 
 `stats.nodes` は根の復旧・双対化の試行も含む処理した LP ノード数。strong branching の試行 LP は含めず、その pivot は `stats.strong_branching_pivots` と `stats.pivots` に含む。`node_limit=1` でも根での試行分枝は行う。`stats.numerical_restarts` はカットを取り除いた再試行と、保存基底からの再最適化を断念した復旧の回数。
@@ -139,6 +139,19 @@ if (r.has_solution) {
 | 項目 | 既定値 | 用途 |
 |---|---:|---|
 | `presolve` | true | 境界伝播、固定変数・冗長行の除去、整数行の gcd 簡約 |
+| `advanced_presolve` | true | 変更行の境界伝播、整数係数の強化、重複行除去 |
+| `equality_substitution` | true | 等式から変数を消去 |
+| `integer_substitution` | false | 整数等式の係数 ±1 の変数を消去 |
+| `probing` | false | 0/1変数の仮固定による境界・係数強化 |
+| `feasibility_pump` | true | 丸め点への LP 射影と仮固定で暫定解を探す |
+| `diving_heuristic` | true | 根 LP から整数変数を仮固定して双対再最適化 |
+| `bounded_variables` | true | 有限上限を追加行にせず単体法で直接扱う |
+| `sparse_tableau` | -1 | -1: 密度に応じて疎密を選択・切替、0: 密、1: 疎辞書を維持（個別の行は密表現も使う） |
+| `basis_repair` | true | 特異基底・残差を検出した場合に基底を再構築・再最適化 |
+| `root_diversification` | true | 暫定解がないとき別の最適基底からも探索 |
+| `dual_devex` | true | 新規の根 LP の双対行選択に Devex の近似重みを使用（分枝・再求解は対象外） |
+| `primal_sweeps` | true | 大きいモデルの根 LP 前に疎な座標改善を試す |
+| `tableau_cache_limit` | 64 MiB | 待機ノードの辞書キャッシュの見積り容量上限 |
 | `scaling` | true | 行を2の冪でスケーリング。小さすぎる目的係数の拡大は別途実行 |
 | `dualize` | true | 変数が多い連続の被覆 LP 等を双対問題へ変換して解く |
 | `warm_start` | true | 分枝先の LP を親の基底から再最適化 |
@@ -161,11 +174,21 @@ if (r.has_solution) {
 
 `r.stats.reduced_cost_fixings` は、探索中に reduced cost と暫定解を使って固定した列数の全ノード合計。固定は現在の暫定解に依存するため、次回用の根基底には持ち越さない。
 
+`stats.bound_flips` は基底交換を伴わない上下限間の移動数で、`stats.pivots` と反復上限に含む。`sparse_pivots`、`sparse_tableaux`、`dense_conversions` で疎密表現の利用状況を確認できる。`basis_refactorizations` は元の係数からの基底再構築回数。`pump_lp_solves` / `pump_pivots` と `diving_lp_solves` / `diving_pivots` は暫定解探索の LP 数・pivot 数を表す。
+
+`presolve_seconds`、`presolve_bound_changes`、`strengthened_coefficients`、`duplicate_rows`、`substituted_variables`、`implied_integers`、`presolved_nonzeros` で前処理の時間と効果を確認できる。`probing_trials` と `probing_bound_changes` は仮固定による強化の統計。
+
 ## 数値計算と規模の限界
 
 `double` による浮動小数点ソルバーで、厳密な有理数・整数証明器ではない。係数の桁が極端に違う、ほぼ平行な制約が多い、巨大な整数を1の差まで区別する場合には誤判定の可能性がある。`is_feasible` は絶対許容誤差に加えて、行の活動量に `1e-12` を掛けた誤差を許す。整数の出力は、`Optimal` または実行可能な暫定解を確認してから丸める。
 
-根の tableau の係数は概ね `8 * (制約数+2) * (変換後変数数+2)` バイトで、行を管理する領域も必要。元の行列・変換情報も別に保持する。根キャッシュは根 tableau を保持し、変換後の不変な係数行は作業領域と共有する。幅の広い辞書では変更されない辞書行も共有する。不要なら `reuse_root=false` とし、既に保存済みなら `clear_root_cache()` で解放する。等式は2本の不等式、自由変数は2変数に変換し、有限上限やカット・分枝が行を増やす。分枝限定では待機ノードごとに変更した行や狭い辞書を持つため、LP より多くのメモリを使う。固定列を除いた探索中の辞書はその分だけ小さくなる。
+単体法は変数の有限上限を直接扱い、係数の密度に応じて疎・密の辞書を選ぶ。密表現の係数領域は概ね `8 * (制約数+2) * (変換後変数数+2)` バイトで、行管理・元の行列・変換情報も別に必要。疎表現では非零係数と索引を保持し、演算で密になった行は密表現に切り替わる。等式消去後に残る等式は2本の不等式、自由変数は2変数に変換する。`bounded_variables=false` では有限上限も行を増やす。
+
+根キャッシュは根の辞書を保持し、不変な係数行や変更されない辞書行を共有する。不要なら `reuse_root=false` とし、保存済みなら `clear_root_cache()` で解放する。`stats.root_storage_bytes` は根 LP 開始時の配列サイズで、プロセス全体の使用メモリではない。
+
+分枝限定では待機ノードにも辞書が必要になる。`tableau_cache_limit` を超えると待機辞書を破棄し、必要になった時点で分枝条件から再構築する。これは辞書キャッシュの見積り上限で、全メモリの厳密な上限ではない。`tableau_evictions`、`tableau_rebuilds`、`peak_pending_tableau_bytes` で破棄・再構築回数と見積り容量の最大値を確認できる。
+
+基底修復では元の係数から補償演算を使って再構築し、元の制約に対する残差も検査する。復旧できない場合は `NumericalError` を返すため、終了状態と暫定解の有無を確認する。
 
 ## 使用例
 

@@ -10,6 +10,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,15 +45,30 @@ struct Options {
     double absolute_gap = 1e-7;
     double relative_gap = 0;
     bool presolve = true;
+    bool advanced_presolve = true; // 変更行の伝播、整数係数強化、重複行除去。
+    bool probing = false; // 0/1仮固定による境界・係数強化。探索経路への影響があるため任意。
+    bool integer_substitution =
+        false; // 整数等式の係数±1の変数を消去。探索経路への影響があるため任意。
+    bool equality_substitution = true; // 等式による変数消去。advanced_presolveで対象を広げる。
     bool scaling = true;
     bool dualize = true; // 連続 LP で有利な形なら双対問題を解く。
     bool warm_start = true;
     bool reuse_root = true; // 同じ Model の再求解で、最適な根基底を保存・再利用。
     bool pseudocost = true;
     bool rounding_heuristic = true;
+    bool feasibility_pump = true; // 暫定解がないとき、丸め点へのLP射影と小規模な仮固定探索。
+    bool diving_heuristic = true; // 根LPから少数の整数仮固定・双対再最適化を試す。
     bool integer_objective = true;
     bool reduced_cost_fixing = true; // 暫定解を改善できない非基底整数変数を固定・列削除。
-    int root_cut_rounds = -1;        // -1: 小数の整数変数が1個のときだけ3巡、0: 無効。
+    bool bounded_variables = true;   // 有限上限を追加行にせず、単体法で直接扱う。
+    int sparse_tableau = -1;         // -1: 密度で自動選択・切替、0: 密、1: 疎辞書を維持。
+    bool basis_repair = true;        // 特異基底・原問題の残差を検出した場合の再構築と再最適化。
+    bool root_diversification =
+        true;               // 暫定解がないとき、別の最適基底からも汎用ヒューリスティックを始める。
+    bool dual_devex = true; // 双対単体法の行選択を参照基底の辺長で重み付け。
+    bool primal_sweeps = true;                       // 大きいモデルの根LP前に疎な座標改善を試す。
+    std::uint64_t tableau_cache_limit = 64ULL << 20; // 待機ノードの辞書の見積りバイト上限。
+    int root_cut_rounds = -1; // -1: 小数の整数変数が1個のときだけ3巡、0: 無効。
     int cuts_per_round = 8;
     int strong_branching_candidates = 4;
     int strong_branching_depth = 3;
@@ -62,12 +78,29 @@ struct Options {
 
 struct Statistics {
     std::uint64_t nodes = 0, pivots = 0, strong_branching_pivots = 0;
+    std::uint64_t bound_flips = 0; // pivots に含まれる、基底交換を伴わない上下限間の移動。
+    std::uint64_t tableau_evictions = 0, tableau_rebuilds = 0;
+    std::uint64_t peak_pending_tableau_bytes = 0;
+    std::uint64_t sparse_pivots = 0, sparse_tableaux = 0, dense_conversions = 0;
     std::uint64_t heuristic_solutions = 0;
+    std::uint64_t basis_refactorizations = 0; // 元係数からの補償演算による基底再構築。
+    std::uint64_t objective_perturbations = 0;
+    std::uint64_t pump_pivots = 0, pump_lp_solves = 0;
+    std::uint64_t diving_pivots = 0, diving_lp_solves = 0;
     int cuts = 0;
     int reduced_cost_fixings = 0;
     int numerical_restarts = 0;
+    int substituted_variables = 0;
+    std::uint64_t presolve_bound_changes = 0, strengthened_coefficients = 0;
+    std::uint64_t probing_trials = 0, probing_bound_changes = 0;
+    int duplicate_rows = 0;
+    int implied_integers = 0;
+    std::uint64_t presolved_nonzeros = 0;
+    double presolve_seconds = 0;
     bool solved_dual = false;
     bool reused_root = false;
+    std::uint64_t root_storage_bytes =
+        0; // 根LP開始時の配列サイズ（ハッシュの空き枠を含む）。RSSではない。
     std::uint64_t root_pivots = 0; // 根の初回求解・再最適化・復旧の総 pivot 数。
     int original_variables = 0, original_constraints = 0;
     int presolved_variables = 0, presolved_constraints = 0;
@@ -164,31 +197,394 @@ struct Budget {
     }
 };
 
+inline bool
+propagate(const std::vector<Row> &rows, std::vector<Variable> &vars, Budget &budget, int rounds);
+
+// 実行不能の証拠の再構成だけに使う、上限付きの符号付き整数。
+// 基数2^30なら積・桁上がりを標準uint64_tだけで処理できる。
+// 大きな式は中止する。LP本体の演算や入力値の丸めには使わない。
+struct ExactOverflow {};
+struct ExactInteger {
+    static constexpr std::uint32_t mask = (1U << 30) - 1;
+    std::vector<std::uint32_t> digits;
+    bool negative = false;
+    ExactInteger(long long value = 0) {
+        negative = value < 0;
+        std::uint64_t a = negative ? std::uint64_t(-(value + 1)) + 1 : std::uint64_t(value);
+        while (a) {
+            digits.push_back(std::uint32_t(a & mask));
+            a >>= 30;
+        }
+    }
+    void normalize() {
+        while (!digits.empty() && !digits.back()) digits.pop_back();
+        if (digits.empty()) negative = false;
+        if (digits.size() > 256) throw ExactOverflow{};
+    }
+    bool zero() const { return digits.empty(); }
+    ExactInteger absolute() const {
+        auto x = *this;
+        x.negative = false;
+        return x;
+    }
+    ExactInteger operator-() const {
+        auto x = *this;
+        if (!x.zero()) x.negative = !x.negative;
+        return x;
+    }
+    static int compare(const ExactInteger &a, const ExactInteger &b) {
+        if (a.digits.size() != b.digits.size()) return a.digits.size() < b.digits.size() ? -1 : 1;
+        for (std::size_t i = a.digits.size(); i--;)
+            if (a.digits[i] != b.digits[i]) return a.digits[i] < b.digits[i] ? -1 : 1;
+        return 0;
+    }
+    friend ExactInteger operator+(const ExactInteger &a, const ExactInteger &b) {
+        ExactInteger c;
+        if (a.negative == b.negative) {
+            c.negative = a.negative;
+            c.digits.resize(std::max(a.digits.size(), b.digits.size()) + 1);
+            std::uint64_t carry = 0;
+            for (std::size_t i = 0; i < c.digits.size(); ++i) {
+                carry += (i < a.digits.size() ? a.digits[i] : 0) +
+                         std::uint64_t(i < b.digits.size() ? b.digits[i] : 0);
+                c.digits[i] = std::uint32_t(carry & mask);
+                carry >>= 30;
+            }
+        } else {
+            const bool swapped = compare(a, b) < 0;
+            const auto &x = swapped ? b : a;
+            const auto &y = swapped ? a : b;
+            c.negative = x.negative;
+            c.digits.resize(x.digits.size());
+            long long borrow = 0;
+            for (std::size_t i = 0; i < x.digits.size(); ++i) {
+                const long long value =
+                    (long long)x.digits[i] - (i < y.digits.size() ? y.digits[i] : 0) - borrow;
+                borrow = value < 0;
+                c.digits[i] = std::uint32_t(value + (borrow << 30));
+            }
+        }
+        c.normalize();
+        return c;
+    }
+    friend ExactInteger operator-(const ExactInteger &a, const ExactInteger &b) { return a + -b; }
+    friend ExactInteger operator*(const ExactInteger &a, const ExactInteger &b) {
+        if (a.zero() || b.zero()) return {};
+        if (a.digits.size() + b.digits.size() > 257) throw ExactOverflow{};
+        ExactInteger c;
+        c.negative = a.negative != b.negative;
+        c.digits.resize(a.digits.size() + b.digits.size());
+        for (std::size_t i = 0; i < a.digits.size(); ++i) {
+            std::uint64_t carry = 0;
+            for (std::size_t j = 0; j < b.digits.size(); ++j) {
+                carry += std::uint64_t(a.digits[i]) * b.digits[j] + c.digits[i + j];
+                c.digits[i + j] = std::uint32_t(carry & mask);
+                carry >>= 30;
+            }
+            c.digits[i + b.digits.size()] = std::uint32_t(carry);
+        }
+        c.normalize();
+        return c;
+    }
+    ExactInteger shifted(int bits) const {
+        if (zero()) return {};
+        if (bits < 0 || digits.size() + std::size_t(bits / 30) > 256) throw ExactOverflow{};
+        ExactInteger c;
+        c.negative = negative;
+        c.digits.resize(digits.size() + bits / 30 + 1);
+        std::uint64_t carry = 0;
+        for (std::size_t i = 0; i < digits.size(); ++i) {
+            carry += std::uint64_t(digits[i]) << (bits % 30);
+            c.digits[i + bits / 30] = std::uint32_t(carry & mask);
+            carry >>= 30;
+        }
+        c.digits.back() = std::uint32_t(carry);
+        c.normalize();
+        return c;
+    }
+    ExactInteger divided(const ExactInteger &divisor) const {
+        if (divisor.zero()) throw ExactOverflow{};
+        ExactInteger q, remainder;
+        q.digits.resize(digits.size());
+        q.negative = negative != divisor.negative;
+        if (divisor.digits.size() == 1) {
+            std::uint64_t carry = 0;
+            for (std::size_t i = digits.size(); i--;) {
+                carry = (carry << 30) + digits[i];
+                q.digits[i] = std::uint32_t(carry / divisor.digits[0]);
+                carry %= divisor.digits[0];
+            }
+            if (carry) throw ExactOverflow{};
+        } else {
+            const auto d = divisor.absolute();
+            for (std::size_t bit = digits.size() * 30; bit--;) {
+                remainder = remainder.shifted(1);
+                if ((digits[bit / 30] >> (bit % 30)) & 1U) remainder = remainder + ExactInteger(1);
+                if (compare(remainder, d) >= 0) {
+                    remainder = remainder - d;
+                    q.digits[bit / 30] |= 1U << (bit % 30);
+                }
+            }
+            if (!remainder.zero()) throw ExactOverflow{};
+        }
+        q.normalize();
+        return q;
+    }
+    static std::pair<long long, int> dyadic(double value) {
+        if (!std::isfinite(value)) throw ExactOverflow{};
+        if (!value) return {0, 0};
+        int exponent = 0;
+        long long mantissa = (long long)std::ldexp(std::frexp(value, &exponent), 53);
+        exponent -= 53;
+        while (mantissa % 2 == 0) {
+            mantissa /= 2;
+            ++exponent;
+        }
+        return {mantissa, exponent};
+    }
+};
+
 // 辞書: x_B = rhs - D x_N, z = rhs_z - D_z x_N。
 // 初期列数は元変数数 + 人工変数 + RHS。固定列は後から削除できる。
 // slack の列を別に持たず交換する。
+// 誤差なし変換を用いた2成分の演算。基底再構築時だけ使用する。
+// long double と double が同じ精度の処理系でも追加の有効桁を保持する。
+struct Accurate {
+    double hi = 0, lo = 0;
+    Accurate() = default;
+    Accurate(double x) : hi(x) {}
+    static Accurate parts(double h, double l) {
+        Accurate r;
+        r.hi = h + l;
+        r.lo = l - (r.hi - h);
+        return r;
+    }
+    friend Accurate operator+(Accurate a, Accurate b) {
+        const double h = a.hi + b.hi, v = h - a.hi;
+        return parts(h, ((a.hi - (h - v)) + (b.hi - v)) + (a.lo + b.lo));
+    }
+    friend Accurate operator-(Accurate a, Accurate b) {
+        b.hi = -b.hi;
+        b.lo = -b.lo;
+        return a + b;
+    }
+    friend Accurate operator*(Accurate a, Accurate b) {
+        const double h = a.hi * b.hi;
+        return parts(h, std::fma(a.hi, b.hi, -h) + a.hi * b.lo + a.lo * b.hi + a.lo * b.lo);
+    }
+    friend Accurate operator/(Accurate a, Accurate b) {
+        const double q = a.hi / b.hi;
+        const auto rem = a - b * Accurate(q);
+        return parts(q, (rem.hi + rem.lo) / b.hi);
+    }
+    double value() const { return hi + lo; }
+};
+
 struct Tableau {
+    struct SparseRow {
+        struct Cell {
+            int column = -1;
+            double value = 0;
+        };
+        std::vector<Cell> table;
+        std::vector<double> full;
+        int count = 0, used = 0;
+        int rhs_column = -1, rhs_slot = -1;
+        static unsigned hash(unsigned x) {
+            const std::uint64_t product = std::uint64_t(x) * 2654435761U;
+            return unsigned(product ^ (product >> 32));
+        }
+        std::size_t position(int j) const {
+            const std::size_t mask = table.size() - 1;
+            std::size_t k = hash(unsigned(j)) & mask, first = table.size();
+            while (table[k].column != -1) {
+                if (table[k].column == j) return k;
+                if (table[k].column == -2 && first == table.size()) first = k;
+                k = (k + 1) & mask;
+            }
+            return first == table.size() ? k : first;
+        }
+        double get(int j) const {
+            if (!full.empty()) return full[j];
+            if (j == rhs_column) return rhs_slot < 0 ? 0 : table[rhs_slot].value;
+            if (table.empty()) return 0;
+            const auto &cell = table[position(j)];
+            return cell.column == j ? cell.value : 0;
+        }
+        void put(std::size_t k, int j, double value) {
+            auto &cell = table[k];
+            if (cell.column == j) {
+                if (value != 0)
+                    cell.value = value;
+                else {
+                    cell.column = -2;
+                    --count;
+                }
+            } else if (value != 0) {
+                used += cell.column == -1;
+                ++count;
+                cell = {j, value};
+            }
+            if (j == rhs_column) rhs_slot = value != 0 ? int(k) : -1;
+        }
+        void reserve(int extra, Budget *budget = nullptr) {
+            if (!full.empty()) return;
+            if (!table.empty() && 2 * (count + extra) <= int(table.size()) &&
+                4 * (used + extra) <= 3 * int(table.size()))
+                return;
+            std::size_t size = 8;
+            while (size < std::size_t(2 * (count + extra))) size *= 2;
+            SparseRow next;
+            next.rhs_column = rhs_column;
+            next.table = budget ? budget->filled<Cell>(size) : std::vector<Cell>(size);
+            for (const auto &cell : table) {
+                if (budget) budget->checkpoint(1);
+                if (cell.column >= 0)
+                    next.put(next.position(cell.column), cell.column, cell.value);
+            }
+            table = std::move(next.table);
+            count = next.count;
+            used = next.used;
+            rhs_slot = next.rhs_slot;
+        }
+        void set(int j, double value) {
+            if (!full.empty()) {
+                full[j] = value;
+                return;
+            }
+            reserve(1);
+            put(position(j), j, value);
+        }
+        void subtract_product(int j, double f, double a) {
+            if (!full.empty()) {
+                full[j] -= f * a;
+                return;
+            }
+            const auto k = position(j);
+            put(k, j, (table[k].column == j ? table[k].value : 0) - f * a);
+        }
+        std::uint64_t bytes() const {
+            return table.size() * sizeof(Cell) + full.size() * sizeof(double);
+        }
+    };
     int n = 0, m = 0, stride = 0, next_id = 0, original_n = 0;
     static constexpr int fixed_zero = std::numeric_limits<int>::max();
     bool primal_feasible = false;
+    bool slack_fixing = true;  // 再構築で追加した行の整数刻みが不明ならslackを固定しない。
+    bool needs_repair = false; // 復旧を中断した辞書の境界を枝刈りに使わない。
     double objective_scale = 1;
+    // 基底交換で更新しない原係数。分枝・カットの追加行も元の座標で保持する。
+    std::vector<std::shared_ptr<const Row>> source_rows;
+    std::shared_ptr<const std::vector<double>> source_cost;
+    bool perturbed = false;
+    bool stable_ratio = false;
     std::vector<double> dense;
     std::vector<std::shared_ptr<std::vector<double>>> data;
+    std::vector<std::shared_ptr<SparseRow>> sparse_rows;
+    std::uint64_t sparse_bytes = 0;
+    mutable std::vector<double> read_buffer; // row() の疎行読み出し用。次の疎行読み出しまで有効。
     std::vector<int> basic, nonbasic;
     std::vector<int> location; // fixed_zero: 0固定、それ以外は非負: 列、負: -行-1。人工変数を除く。
-    std::vector<int> pivot_columns;   // 疎な pivot 行の非ゼロ列。作業領域なので複製不要。
-    std::vector<double *> pivot_rows; // detach 済みの行。pivot 中だけ有効。
-    const double *row(int i) const {
+    std::vector<double> upper;          // 元の構造変数だけ。空なら全て上限なし。
+    std::vector<unsigned char> flipped; // 1: 辞書の座標は upper[id] - x[id]。
+    std::vector<int> pivot_columns;     // 疎な pivot 行の非ゼロ列。作業領域なので複製不要。
+    std::vector<double *> pivot_rows;   // detach 済みの行。pivot 中だけ有効。
+    Terms sparse_entries;               // 疎pivotの作業領域。反復ごとの再確保を避ける。
+    std::vector<int> sparse_affected;
+    const double *dense_row(int i) const {
         return data.empty() ? dense.data() + std::size_t(i) * stride : data[i]->data();
     }
+    const double *row(int i) const {
+        if (!sparse_rows.empty()) {
+            const auto &r = *sparse_rows[i];
+            if (!r.full.empty()) return r.full.data();
+            read_buffer.assign(stride, 0);
+            for (const auto &cell : r.table)
+                if (cell.column >= 0) read_buffer[cell.column] = cell.value;
+            return read_buffer.data();
+        }
+        return dense_row(i);
+    }
+    double coefficient(int i, int j) const {
+        return sparse_rows.empty() ? dense_row(i)[j] : sparse_rows[i]->get(j);
+    }
+    std::uint64_t stored_bytes() const {
+        return sparse_rows.empty() ? std::uint64_t(m + 2) * stride * sizeof(double) : sparse_bytes;
+    }
+    template <class F> void nonzeros(int i, F fn) const {
+        if (!sparse_rows.empty() && sparse_rows[i]->full.empty()) {
+            for (const auto &cell : sparse_rows[i]->table)
+                if (cell.column >= 0) fn(cell.column, cell.value);
+        } else {
+            const double *q = row(i);
+            for (int j = 0; j < stride; ++j)
+                if (q[j] != 0) fn(j, q[j]);
+        }
+    }
+    void make_full(SparseRow &r, Budget *budget = nullptr) const {
+        if (!r.full.empty()) return;
+        auto full = budget ? budget->filled<double>(stride) : std::vector<double>(stride);
+        for (const auto &cell : r.table) {
+            if (budget) budget->checkpoint(1);
+            if (cell.column >= 0) full[cell.column] = cell.value;
+        }
+        r.full = std::move(full);
+        std::vector<SparseRow::Cell>{}.swap(r.table);
+        r.count = r.used = 0;
+    }
+    SparseRow &prepare_row(int i, int extra, Budget &budget) {
+        auto &ptr = sparse_rows[i];
+        const auto before = ptr->bytes();
+        if (ptr.use_count() != 1) {
+            auto next = std::make_shared<SparseRow>();
+            next->table = budget.copy(ptr->table);
+            next->full = budget.copy(ptr->full);
+            next->count = ptr->count;
+            next->used = ptr->used;
+            next->rhs_column = ptr->rhs_column;
+            next->rhs_slot = ptr->rhs_slot;
+            ptr = std::move(next);
+        }
+        if (ptr->full.empty() && (ptr->count + extra) * 8 > stride)
+            make_full(*ptr, &budget);
+        else
+            ptr->reserve(extra, &budget);
+        sparse_bytes = sparse_bytes - before + ptr->bytes();
+        return *ptr;
+    }
     double *write_row(int i, Budget *budget = nullptr) {
+        if (!sparse_rows.empty()) {
+            Options options;
+            Statistics stats;
+            Budget unlimited{options, stats};
+            Budget &b = budget ? *budget : unlimited;
+            auto &r = prepare_row(i, 0, b);
+            const auto before = r.bytes();
+            make_full(r, &b);
+            sparse_bytes = sparse_bytes - before + r.bytes();
+            return r.full.data();
+        }
+        return write_dense_row(i, budget);
+    }
+    double *write_dense_row(int i, Budget *budget = nullptr) {
         if (data.empty()) return dense.data() + std::size_t(i) * stride;
         if (data[i].use_count() != 1)
             data[i] =
                 std::make_shared<std::vector<double>>(budget ? budget->copy(*data[i]) : *data[i]);
         return data[i]->data();
     }
-    double value() const { return row(m)[n + 1] / objective_scale; }
+    double value() const { return coefficient(m, n + 1) / objective_scale; }
+    double bound(int id) const {
+        return !upper.empty() && id >= 0 && id < original_n ? upper[id] : inf;
+    }
+    bool reversed(int id) const {
+        return !flipped.empty() && id >= 0 && id < original_n && flipped[id];
+    }
+    double coordinate(int id) const {
+        const int pos = location[id];
+        const double v = pos < 0 ? coefficient(-pos - 1, n + 1) : 0;
+        return reversed(id) ? upper[id] - v : v;
+    }
     void scale_objective(const std::vector<double> &c) {
         double largest = 0;
         for (double v : c) largest = std::max(largest, std::abs(v));
@@ -210,10 +606,14 @@ struct Tableau {
         original_n = other.original_n;
         objective_scale = other.objective_scale;
         primal_feasible = other.primal_feasible;
+        needs_repair = other.needs_repair;
+        slack_fixing = other.slack_fixing;
         // 複製直後の分枝行1本で再確保しない。値のコピーと行追加で二重に
         // 配列をコピーするコストを避ける（探索・分枝の順序は同じ）。
         if (!other.data.empty()) data.reserve(other.data.size() + 1);
         data = other.data;
+        sparse_rows = other.sparse_rows;
+        sparse_bytes = other.sparse_bytes;
         dense.reserve(other.dense.size() + (other.dense.empty() ? 0 : std::size_t(stride) * 2));
         dense.assign(other.dense.begin(), other.dense.end());
         basic.reserve(other.basic.size() + 1);
@@ -221,6 +621,12 @@ struct Tableau {
         basic = other.basic;
         nonbasic = other.nonbasic;
         location = other.location;
+        upper = other.upper;
+        flipped = other.flipped;
+        source_rows = other.source_rows;
+        source_cost = other.source_cost;
+        perturbed = other.perturbed;
+        stable_ratio = other.stable_ratio;
         return *this;
     }
     // 再求解の保存・復元時は、既存の不変スナップショットを壊さず複製する。
@@ -232,9 +638,13 @@ struct Tableau {
         t.next_id = next_id;
         t.original_n = original_n;
         t.primal_feasible = primal_feasible;
+        t.needs_repair = needs_repair;
+        t.slack_fixing = slack_fixing;
         t.objective_scale = objective_scale;
         budget.checkpoint();
         t.data = budget.copy(data);
+        t.sparse_rows = budget.copy(sparse_rows);
+        t.sparse_bytes = sparse_bytes;
         t.dense.reserve(dense.size() + (dense.empty() ? 0 : std::size_t(stride) * 2));
         budget.chunks(dense.size(), [&](std::size_t begin, std::size_t end) {
             t.dense.insert(t.dense.end(), dense.begin() + begin, dense.begin() + end);
@@ -242,6 +652,12 @@ struct Tableau {
         t.basic = budget.copy(basic);
         t.nonbasic = budget.copy(nonbasic);
         t.location = budget.copy(location);
+        t.upper = budget.copy(upper);
+        t.flipped = budget.copy(flipped);
+        t.source_rows = budget.copy(source_rows);
+        t.source_cost = source_cost;
+        t.perturbed = perturbed;
+        t.stable_ratio = stable_ratio;
         return t;
     }
     Tableau(Tableau &&) = default;
@@ -264,11 +680,115 @@ struct Tableau {
         else
             copy(0, a.size());
     }
+    static Terms sparse_coefficients(const Terms &a, Budget *budget) {
+        Terms result = budget ? budget->copy(a) : a;
+        if (!std::is_sorted(
+                result.begin(), result.end(), [](auto a, auto b) { return a.first < b.first; }))
+            std::stable_sort(result.begin(), result.end(), [budget](auto a, auto b) {
+                if (budget) budget->checkpoint(1);
+                return a.first < b.first;
+            });
+        std::size_t out = 0;
+        for (std::size_t k = 0; k < result.size(); ++k) {
+            if (budget) budget->checkpoint(1);
+            if (k + 1 < result.size() && result[k].first == result[k + 1].first) continue;
+            if (result[k].second) result[out++] = result[k];
+        }
+        result.resize(out);
+        return result;
+    }
+    static Terms sparse_coefficients(const std::vector<double> &a, Budget *budget) {
+        Terms result;
+        for (int j = 0; j < int(a.size()); ++j) {
+            if (budget) budget->checkpoint(1);
+            if (a[j]) result.emplace_back(j, a[j]);
+        }
+        return result;
+    }
+    static std::size_t count_nonzero(const Terms &a, Budget *) { return a.size(); }
+    static std::size_t count_nonzero(const std::vector<double> &a, Budget *budget) {
+        std::size_t result = 0;
+        for (double v : a) {
+            if (budget) budget->checkpoint(1);
+            result += v != 0;
+        }
+        return result;
+    }
+    void initialize_row(SparseRow &r, const Terms &entries, Budget *budget = nullptr) const {
+        r.rhs_column = n + 1;
+        r.reserve(int(entries.size()), budget);
+        for (auto [j, a] : entries) {
+            if (budget) budget->checkpoint(1);
+            r.set(j, a);
+        }
+        if (r.count * 8 > stride) make_full(r, budget);
+    }
     template <class Matrix>
     Tableau(const Matrix &a, const std::vector<double> &b, const std::vector<double> &c,
-            Budget *budget = nullptr)
+            Budget *budget = nullptr, const std::vector<double> &bounds = {})
         : n(int(c.size())), m(int(b.size())), stride(n + 2), next_id(n + m), original_n(n),
           basic(m), nonbasic(n + 1), location(n + m) {
+        upper = budget ? budget->copy(bounds) : bounds;
+        if (!upper.empty())
+            flipped = budget ? budget->filled<unsigned char>(n) : std::vector<unsigned char>(n);
+        source_cost = std::make_shared<const std::vector<double>>(budget ? budget->copy(c) : c);
+        source_rows.reserve(m);
+        for (int i = 0; i < m; ++i)
+            source_rows.push_back(
+                std::make_shared<const Row>(Row{sparse_coefficients(a[i], budget), b[i]}));
+        double smallest = inf, largest = 0;
+        for (const auto &r : source_rows)
+            for (auto [j, value] : r->terms) {
+                if (budget) budget->checkpoint(1);
+                (void)j;
+                if (value) {
+                    smallest = std::min(smallest, std::abs(value));
+                    largest = std::max(largest, std::abs(value));
+                }
+            }
+        // 係数の桁差が大きい辞書では、初めから二段階の比率検定を使う。
+        // それ以外でも小pivot・残差による再構築を契機に切り替える。
+        stable_ratio = largest > 1000 * smallest;
+        const int sparse_mode = budget ? budget->opt.sparse_tableau : -1;
+        bool use_sparse = sparse_mode == 1;
+        if (sparse_mode == -1 && std::uint64_t(n) * m >= (1ULL << 20)) {
+            std::uint64_t nnz = 0;
+            for (int i = 0; i < m; ++i) {
+                if (budget) budget->checkpoint(1);
+                nnz += count_nonzero(a[i], budget);
+            }
+            use_sparse = nnz * 128 <= std::uint64_t(n) * m;
+        }
+        if (use_sparse) {
+            sparse_rows.reserve(m + 2);
+            for (int i = 0; i < m; ++i) {
+                auto r = std::make_shared<SparseRow>();
+                auto entries = sparse_coefficients(a[i], budget);
+                entries.emplace_back(n, -1);
+                if (b[i]) entries.emplace_back(n + 1, b[i]);
+                initialize_row(*r, entries, budget);
+                sparse_bytes += r->bytes();
+                sparse_rows.push_back(std::move(r));
+                basic[i] = n + i;
+                location[n + i] = -i - 1;
+            }
+            scale_objective(c);
+            for (int i = 0; i < 2; ++i) {
+                auto r = std::make_shared<SparseRow>();
+                r->full = budget ? budget->filled<double>(stride) : std::vector<double>(stride);
+                sparse_bytes += r->bytes();
+                sparse_rows.push_back(std::move(r));
+            }
+            for (int j = 0; j < n; ++j) {
+                nonbasic[j] = j;
+                location[j] = j;
+                sparse_rows[m]->full[j] = -c[j] * objective_scale;
+            }
+            nonbasic[n] = -1;
+            sparse_rows[m + 1]->full[n] = 1;
+            if (budget) ++budget->stats.sparse_tableaux;
+            return;
+        }
         if (stride < 128)
             dense = budget ? budget->filled<double>(std::size_t(m + 2) * stride)
                            : std::vector<double>(std::size_t(m + 2) * stride);
@@ -297,12 +817,87 @@ struct Tableau {
         write_row(m + 1)[n] = 1;
     }
 
+    void to_dense(Budget &budget) {
+        if (sparse_rows.empty()) return;
+        std::vector<std::shared_ptr<std::vector<double>>> next;
+        next.reserve(m + 2);
+        for (int i = 0; i < m + 2; ++i) {
+            auto values = budget.filled<double>(stride);
+            nonzeros(i, [&](int j, double v) {
+                budget.checkpoint(1);
+                values[j] = v;
+            });
+            next.push_back(std::make_shared<std::vector<double>>(std::move(values)));
+        }
+        data = std::move(next);
+        sparse_rows.clear();
+        sparse_bytes = 0;
+        ++budget.stats.dense_conversions;
+    }
+
+    // 共有行の分離・ハッシュ容量の確保を全て済ませてから数値を更新する。
+    // 数値更新は通常の密pivot同様に一括。確保中の期限切れでも基底は一貫している。
+    void sparse_pivot(int r, int s, Budget &budget) {
+        const double inv = 1 / coefficient(r, s);
+        auto &entries = sparse_entries;
+        entries.clear();
+        nonzeros(r, [&](int j, double a) {
+            budget.checkpoint(1);
+            entries.emplace_back(j, a);
+        });
+        auto &affected = sparse_affected;
+        affected.clear();
+        for (int i = 0; i < m + 2; ++i) {
+            budget.checkpoint(1);
+            if (i == r || coefficient(i, s) == 0) continue;
+            prepare_row(i, int(entries.size()), budget);
+            affected.push_back(i);
+        }
+        prepare_row(r, 1, budget);
+        for (int i : affected) {
+            auto &q = *sparse_rows[i];
+            const double f = q.get(s) * inv;
+            for (auto [j, a] : entries)
+                if (j != s) q.subtract_product(j, f, a);
+            // 予約済み容量のためsetの追加確保を避ける。
+            if (!q.full.empty())
+                q.full[s] = -f;
+            else
+                q.put(q.position(s), s, -f);
+        }
+        auto &p = *sparse_rows[r];
+        if (!p.full.empty()) {
+            for (double &a : p.full) a *= inv;
+            p.full[s] = inv;
+        } else {
+            for (auto &cell : p.table)
+                if (cell.column >= 0) cell.value *= inv;
+            p.put(p.position(s), s, inv);
+        }
+        std::swap(basic[r], nonbasic[s]);
+        if (basic[r] >= 0) location[basic[r]] = -r - 1;
+        if (nonbasic[s] >= 0) location[nonbasic[s]] = s;
+        ++budget.stats.pivots;
+        ++budget.stats.sparse_pivots;
+    }
+
     void pivot(int r, int s, Budget &budget) {
-        double *p = write_row(r, &budget);
+        if (!sparse_rows.empty()) {
+            if (budget.opt.sparse_tableau != 1 &&
+                sparse_bytes * 16 > std::uint64_t(m + 2) * stride * sizeof(double))
+                to_dense(budget);
+            else {
+                sparse_pivot(r, s, budget);
+                return;
+            }
+        }
+        double *p = write_dense_row(r, &budget);
         pivot_rows.clear();
         if (!data.empty())
             for (int i = 0; i < m + 2; ++i)
-                if (i != r && row(i)[s] != 0) { pivot_rows.push_back(write_row(i, &budget)); }
+                if (i != r && dense_row(i)[s] != 0) {
+                    pivot_rows.push_back(write_dense_row(i, &budget));
+                }
         const double inv = 1 / p[s];
         // フロー等では辞書を密に保存していても pivot 行は疎なことが多い。
         // 密な行は早めに走査を打ち切り、従来の連続ループを使う。
@@ -342,12 +937,272 @@ struct Tableau {
         ++budget.stats.pivots;
     }
 
-    Status primal(int objective_row, Budget &budget) {
+    // 基底変数の上限を下限0に読み替える。実際の点・目的値は変わらない。
+    void reverse_basic(int r, Budget &budget) {
+        const int id = basic[r];
+        if (!sparse_rows.empty()) {
+            auto &q = prepare_row(r, 1, budget);
+            const double rhs = upper[id] - q.get(n + 1);
+            if (!q.full.empty()) {
+                for (double &a : q.full) a = -a;
+                q.full[n + 1] = rhs;
+            } else {
+                for (auto &cell : q.table)
+                    if (cell.column >= 0) cell.value = -cell.value;
+                q.put(q.position(n + 1), n + 1, rhs);
+            }
+            flipped[id] ^= 1;
+            return;
+        }
+        double *q = write_dense_row(r, &budget);
+        for (int j = 0; j <= n; ++j) q[j] = -q[j];
+        q[n + 1] = upper[id] - q[n + 1];
+        flipped[id] ^= 1;
+    }
+
+    // 非基底変数が反対側の上限に達した場合、基底交換なしに座標を反転。
+    // 共有行の確保中は数値を変更しない。中断後も辞書は一貫したまま。
+    void flip_nonbasic(int s, Budget &budget) {
+        const int id = nonbasic[s];
+        const double u = upper[id];
+        if (!sparse_rows.empty()) {
+            auto &affected = sparse_affected;
+            affected.clear();
+            for (int i = 0; i < m + 2; ++i) {
+                budget.checkpoint(1);
+                if (coefficient(i, s) == 0) continue;
+                prepare_row(i, 1, budget);
+                affected.push_back(i);
+            }
+            for (int i : affected) {
+                auto &q = *sparse_rows[i];
+                const double a = q.get(s);
+                const double rhs = q.get(n + 1) - a * u;
+                if (!q.full.empty()) {
+                    q.full[n + 1] = rhs;
+                    q.full[s] = -a;
+                } else {
+                    q.put(q.position(n + 1), n + 1, rhs);
+                    q.put(q.position(s), s, -a);
+                }
+            }
+            flipped[id] ^= 1;
+            ++budget.stats.pivots;
+            ++budget.stats.bound_flips;
+            return;
+        }
+        pivot_rows.clear();
+        for (int i = 0; i < m + 2; ++i)
+            if (dense_row(i)[s] != 0) pivot_rows.push_back(write_dense_row(i, &budget));
+        for (double *q : pivot_rows) {
+            q[n + 1] -= q[s] * u;
+            q[s] = -q[s];
+        }
+        flipped[id] ^= 1;
+        ++budget.stats.pivots;
+        ++budget.stats.bound_flips;
+    }
+
+    bool consistent(Budget &budget) const {
+        if (!source_cost || perturbed) return true;
+        // 同じ変数を各非ゼロ係数から何度もたどらず、基底の値を一度だけ読む。
+        std::vector<double> values;
+        values.reserve(original_n);
+        budget.chunks(original_n, [&](std::size_t first, std::size_t last) {
+            for (auto j = first; j < last; ++j) values.push_back(coordinate(int(j)));
+        });
+        for (int i = 0; i < m; ++i) {
+            budget.checkpoint(1);
+            const auto &src = *source_rows[i];
+            double residual = src.rhs - coordinate(original_n + i);
+            double magnitude = 1 + std::abs(src.rhs) + std::abs(coordinate(original_n + i));
+            for (auto [j, a] : src.terms) {
+                budget.checkpoint(1);
+                const double x = values[j];
+                residual = std::fma(-a, x, residual);
+                magnitude += std::abs(a * x);
+            }
+            if (!std::isfinite(residual) || std::abs(residual) > 2e-12 * magnitude) return false;
+        }
+        double residual = value(), magnitude = 1 + std::abs(residual);
+        for (int j = 0; j < original_n; ++j) {
+            budget.checkpoint(1);
+            const double x = values[j], c = (*source_cost)[j];
+            residual = std::fma(-c, x, residual);
+            magnitude += std::abs(c * x);
+        }
+        return std::isfinite(residual) && std::abs(residual) <= 2e-12 * magnitude;
+    }
+    bool dual_feasible(double eps) const {
+        if (needs_repair) return false;
+        const double *z = row(m);
+        for (int j = 0; j <= n; ++j)
+            if (nonbasic[j] >= 0 && (!std::isfinite(z[j]) || z[j] < -eps)) return false;
+        return true;
+    }
+
+    // 制約の残差が正常なら、目的行だけを補償加算で作り直す。
+    // 目的行の誤差のためにO(m*n*min(m,n))の基底再構築を行う費用を避ける。
+    bool restore_objective(Budget &budget) {
+        if (!source_cost || perturbed) return false;
+        auto z = budget.filled<Accurate>(stride);
+        for (int id = 0; id < original_n; ++id) {
+            budget.checkpoint(1);
+            double cost = (*source_cost)[id] * objective_scale;
+            if (cost == 0) continue;
+            if (reversed(id)) {
+                z[n + 1] = z[n + 1] + Accurate(cost) * Accurate(upper[id]);
+                cost = -cost;
+            }
+            const int pos = location[id];
+            if (pos == fixed_zero) continue;
+            if (pos >= 0)
+                z[pos] = z[pos] - Accurate(cost);
+            else
+                nonzeros(-pos - 1, [&](int j, double a) {
+                    budget.checkpoint(1);
+                    z[j] = z[j] + Accurate(cost) * Accurate(a);
+                });
+        }
+        auto values = budget.filled<double>(stride);
+        for (int j = 0; j < stride; ++j) {
+            budget.checkpoint(1);
+            values[j] = z[j].value();
+            if (!std::isfinite(values[j])) return false;
+        }
+        // 全て準備してから短い配列を一括交換。途中で目的行を半更新にしない。
+        double *target = write_row(m, &budget);
+        std::copy(values.begin(), values.end(), target);
+        return true;
+    }
+
+    // 元の係数から現在の基底を再構築。別領域で完成させてから交換するため、
+    // 途中の時間切れは元の辞書・暫定解を変更しない。
+    bool refactor(Budget &budget, bool repair_basis = false) {
+        if (!source_cost || perturbed) return false;
+        bool repaired = false;
+        for (int id : basic)
+            if (id < 0) {
+                if (!repair_basis) return false;
+                repaired = true;
+            }
+        const int width = original_n + 2;
+        auto work = budget.filled<Accurate>(std::size_t(m + 1) * width);
+        auto get = [&](int i) { return work.data() + std::size_t(i) * width; };
+        auto rows = budget.filled<int>(m);
+        auto cols = budget.filled<int>(original_n + 1);
+        auto wanted = budget.filled<unsigned char>(next_id);
+        for (int id : basic)
+            if (id >= 0) wanted[id] = 1;
+        for (int i = 0; i < m; ++i) {
+            rows[i] = original_n + i;
+            auto *q = get(i);
+            q[original_n] = -1;
+            q[original_n + 1] = source_rows[i]->rhs;
+            for (auto [j, a] : source_rows[i]->terms) {
+                budget.checkpoint(1);
+                q[j] = q[j] + Accurate(a);
+            }
+        }
+        for (int j = 0; j < original_n; ++j) {
+            cols[j] = j;
+            get(m)[j] = -(*source_cost)[j] * objective_scale;
+            if (reversed(j))
+                for (int i = 0; i <= m; ++i) {
+                    budget.checkpoint(1);
+                    auto *q = get(i);
+                    q[original_n + 1] = q[original_n + 1] - q[j] * Accurate(upper[j]);
+                    q[j] = Accurate(0) - q[j];
+                }
+        }
+        cols[original_n] = -1;
+        while (true) {
+            int r = -1, s = -1;
+            double largest = 0;
+            bool remaining = false;
+            for (int j = 0; j < original_n; ++j)
+                if (cols[j] >= 0 && wanted[cols[j]]) {
+                    remaining = true;
+                    for (int i = 0; i < m; ++i)
+                        if (!wanted[rows[i]]) {
+                            budget.checkpoint(1);
+                            const double a = std::abs(get(i)[j].value());
+                            if (a > largest) {
+                                largest = a;
+                                r = i;
+                                s = j;
+                            }
+                        }
+                }
+            if (!remaining) break;
+            if (r < 0 || largest < 1e-25 || !std::isfinite(largest)) {
+                if (!repair_basis) return false;
+                // 丸め誤差で選ばれた特異な基底は、独立な列と残ったslackで修復する。
+                // 固定済みの非基底変数は復活させない。
+                for (int id : rows)
+                    if (location[id] == fixed_zero) return false;
+                repaired = true;
+                break;
+            }
+            auto *p = get(r);
+            const Accurate inverse = Accurate(1) / p[s];
+            for (int i = 0; i <= m; ++i)
+                if (i != r) {
+                    auto *q = get(i);
+                    if (q[s].value() == 0) continue;
+                    const auto f = q[s] * inverse;
+                    budget.chunks(width, [&](std::size_t first, std::size_t last) {
+                        for (auto j = first; j < last; ++j)
+                            if (int(j) != s) q[j] = q[j] - f * p[j];
+                    });
+                    q[s] = Accurate(0) - f;
+                }
+            for (int j = 0; j < width; ++j) p[j] = p[j] * inverse;
+            p[s] = inverse;
+            std::swap(rows[r], cols[s]);
+        }
+        auto row_position = budget.filled<int>(next_id, -1);
+        auto col_position = budget.filled<int>(next_id, -1);
+        for (int i = 0; i < m; ++i) row_position[rows[i]] = i;
+        for (int j = 0; j <= original_n; ++j)
+            if (cols[j] >= 0) col_position[cols[j]] = j;
+        Tableau next = clone(budget);
+        if (repaired) {
+            next.basic = rows;
+            next.nonbasic.clear();
+            for (int id : cols)
+                if (id < 0 || location[id] != fixed_zero) next.nonbasic.push_back(id);
+            if (next.nonbasic.size() != std::size_t(n + 1)) return false;
+            for (int i = 0; i < m; ++i) next.location[next.basic[i]] = -i - 1;
+            for (int j = 0; j <= n; ++j)
+                if (next.nonbasic[j] >= 0) next.location[next.nonbasic[j]] = j;
+        }
+        for (int i = 0; i <= m; ++i) {
+            double *dest = next.write_row(i, &budget);
+            const auto *src = get(i == m ? m : row_position[next.basic[i]]);
+            for (int j = 0; j <= n; ++j) {
+                budget.checkpoint(1);
+                dest[j] =
+                    src[next.nonbasic[j] < 0 ? original_n : col_position[next.nonbasic[j]]].value();
+                if (!std::isfinite(dest[j])) return false;
+            }
+            dest[n + 1] = src[original_n + 1].value();
+            if (!std::isfinite(dest[n + 1])) return false;
+        }
+        *this = std::move(next);
+        ++budget.stats.basis_refactorizations;
+        return true;
+    }
+
+    Status primal(int objective_row, Budget &budget, bool allow_recovery = true) {
         const double eps = budget.opt.pivot_tolerance;
         int degenerate = 0;
         bool bland = false;
         while (true) {
             if (budget.stop()) return Status::Limit;
+            if (allow_recovery && objective_row == m && budget.opt.basis_repair && !perturbed &&
+                degenerate > std::max(64, m + n))
+                return recover_basis(budget);
             const double *z = row(objective_row);
             int s = -1;
             for (int j = 0; j <= n; ++j) {
@@ -356,18 +1211,44 @@ struct Tableau {
             }
             if (s < 0) return Status::Optimal;
             int r = -1;
-            double ratio = inf;
-            for (int i = 0; i < m; ++i) {
-                const double *q = row(i);
-                if (q[s] <= eps) continue;
-                const double v = std::max(0.0, q[n + 1]) / q[s];
-                if (v < ratio - eps ||
-                    (std::abs(v - ratio) <= eps && (r < 0 || basic[i] < basic[r]))) {
+            double ratio = inf, largest = 0;
+            bool upper_leaves = false;
+            const double cap = bound(nonbasic[s]);
+            double relaxed = cap;
+            auto scan = [&](auto consider) {
+                if (sparse_rows.empty()) {
+                    for (int i = 0; i < m; ++i) {
+                        const double *q = dense_row(i);
+                        consider(i, q[s], q[n + 1]);
+                    }
+                } else
+                    for (int i = 0; i < m; ++i)
+                        consider(i, coefficient(i, s), coefficient(i, n + 1));
+            };
+            if (stable_ratio && !bland)
+                scan([&](int i, double a, double rhs) {
+                    const bool at_upper = a < -eps && std::isfinite(bound(basic[i]));
+                    if (a <= eps && !at_upper) return;
+                    const double slack = at_upper ? bound(basic[i]) - rhs : rhs;
+                    relaxed = std::min(relaxed, (std::max(0.0, slack) + eps) / std::abs(a));
+                });
+            scan([&](int i, double a, double rhs) {
+                const bool at_upper = a < -eps && std::isfinite(bound(basic[i]));
+                if (a <= eps && !at_upper) return;
+                const double v = std::max(0.0, at_upper ? bound(basic[i]) - rhs : rhs) / std::abs(a);
+                if ((!stable_ratio || bland) ? ((bland ? v < ratio : v < ratio - eps) ||
+                                                ((bland ? v == ratio : std::abs(v - ratio) <= eps) &&
+                                                 (r < 0 || basic[i] < basic[r])))
+                                             : (v <= relaxed && (r < 0 || std::abs(a) > largest))) {
                     r = i;
                     ratio = v;
+                    largest = std::abs(a);
+                    upper_leaves = at_upper;
                 }
-            }
-            if (r < 0) return Status::Unbounded;
+            });
+            const bool flip = std::isfinite(cap) && (r < 0 || cap < (bland ? ratio : ratio - eps));
+            if (r < 0 && !flip) return Status::Unbounded;
+            if (flip) ratio = cap;
             if (ratio <= eps)
                 ++degenerate;
             else {
@@ -375,35 +1256,523 @@ struct Tableau {
                 bland = false;
             }
             if (degenerate > 32) bland = true; // 退化が続いたら循環を避ける。
-            pivot(r, s, budget);
+            if (flip)
+                flip_nonbasic(s, budget);
+            else {
+                if (upper_leaves) reverse_basic(r, budget);
+                pivot(r, s, budget);
+            }
             if (!std::isfinite(value())) return Status::NumericalError;
         }
+    }
+
+    // 浮動小数点の乗数で相殺しきれない無上限変数がある場合だけ、
+    // 小さな支持集合の零空間を分数なし消去で求め直す。得られた証拠は
+    // 入力doubleをそのまま二進有理数として、全列・全境界で再検査する。
+    // 支持・桁数の上限を超えたら通常の基底復旧へ戻り、証拠を推測しない。
+    bool
+    exact_infeasible(int objective_row, Budget &budget, const std::vector<Variable> &vars) const {
+        try {
+            std::vector<int> support;
+            std::vector<double> approximate;
+            const double *z = row(objective_row);
+            for (int i = 0; i < m; ++i) {
+                budget.checkpoint(1);
+                const int pos = location[original_n + i];
+                const double weight = pos >= 0 && pos != fixed_zero          ? z[pos]
+                                      : pos < 0 && -pos - 1 == objective_row ? 1
+                                                                             : 0;
+                if (std::isfinite(weight) && weight > 0) {
+                    support.push_back(i);
+                    approximate.push_back(weight);
+                }
+            }
+            const int k = int(support.size());
+            if (!k || k > 96 || std::uint64_t(k) * original_n > 65536) return false;
+            // 微小な乗数を従属変数に選ぶと、僅かな修正で符号が反転する。
+            // 大きい乗数から消去し、小さい乗数は自由変数側に残す。
+            std::vector<int> order(k);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return approximate[a] > approximate[b]; });
+            auto old_support = support;
+            auto old_approximate = approximate;
+            for (int i = 0; i < k; ++i) {
+                support[i] = old_support[order[i]];
+                approximate[i] = old_approximate[order[i]];
+            }
+            auto exponents = budget.filled<int>(k);
+            auto coefficients = budget.filled<ExactInteger>(std::size_t(original_n) * k);
+            auto at = [&](int column, int i) -> ExactInteger & {
+                return coefficients[std::size_t(column) * k + i];
+            };
+            for (int i = 0; i < k; ++i) {
+                const auto &src = *source_rows[support[i]];
+                for (auto [j, a] : src.terms) {
+                    budget.checkpoint(1);
+                    if (a) exponents[i] = std::min(exponents[i], ExactInteger::dyadic(a).second);
+                }
+                for (auto [j, a] : src.terms) {
+                    budget.checkpoint(1);
+                    const auto part = ExactInteger::dyadic(a);
+                    at(j, i) =
+                        at(j, i) + ExactInteger(part.first).shifted(part.second - exponents[i]);
+                }
+            }
+            auto sums = budget.filled<double>(original_n);
+            auto magnitudes = budget.filled<double>(original_n);
+            for (int i = 0; i < k; ++i)
+                for (auto [j, a] : source_rows[support[i]]->terms) {
+                    budget.checkpoint(1);
+                    sums[j] += approximate[i] * a;
+                    magnitudes[j] += std::abs(approximate[i] * a);
+                }
+            std::vector<std::vector<ExactInteger>> equations;
+            for (int j = 0; j < original_n; ++j)
+                if (!std::isfinite(vars[j].upper) &&
+                    std::abs(sums[j]) <= 1e-7 * std::max(1.0, magnitudes[j])) {
+                    budget.checkpoint();
+                    equations.emplace_back(coefficients.begin() + std::size_t(j) * k,
+                                           coefficients.begin() + std::size_t(j + 1) * k);
+                }
+            std::vector<int> pivots;
+            ExactInteger previous(1);
+            for (int column = 0; column < k && pivots.size() < equations.size(); ++column) {
+                const int rank = int(pivots.size());
+                int chosen = rank;
+                while (chosen < int(equations.size()) && equations[chosen][column].zero())
+                    ++chosen;
+                if (chosen == int(equations.size())) continue;
+                std::swap(equations[rank], equations[chosen]);
+                const auto pivot_value = equations[rank][column];
+                for (int i = rank + 1; i < int(equations.size()); ++i) {
+                    const auto factor = equations[i][column];
+                    for (int j = column + 1; j < k; ++j) {
+                        budget.checkpoint(pivot_value.digits.size() > 16 ? Budget::check_interval
+                                                                         : 64);
+                        equations[i][j] =
+                            (pivot_value * equations[i][j] - factor * equations[rank][j])
+                                .divided(previous);
+                    }
+                    equations[i][column] = ExactInteger{};
+                }
+                previous = pivot_value;
+                pivots.push_back(column);
+            }
+            if (int(pivots.size()) == k) return false;
+            auto weights = budget.filled<ExactInteger>(k);
+            int weight_exponent = 0;
+            for (int i = 0; i < k; ++i)
+                weight_exponent = std::min(
+                    weight_exponent, ExactInteger::dyadic(approximate[i]).second + exponents[i]);
+            for (int i = 0; i < k; ++i)
+                if (!std::binary_search(pivots.begin(), pivots.end(), i)) {
+                    const auto part = ExactInteger::dyadic(approximate[i]);
+                    weights[i] =
+                        previous *
+                        ExactInteger(part.first).shifted(part.second + exponents[i] - weight_exponent);
+                }
+            for (int r = int(pivots.size()); r--;) {
+                const int column = pivots[r];
+                ExactInteger sum;
+                for (int j = column + 1; j < k; ++j) {
+                    budget.checkpoint(64);
+                    sum = sum - equations[r][j] * weights[j];
+                }
+                weights[column] = sum.divided(equations[r][column]);
+            }
+            if (previous.negative)
+                for (auto &w : weights) w = -w;
+            for (const auto &w : weights)
+                if (w.negative) return false;
+            int exponent = 0;
+            for (int i = 0; i < k; ++i)
+                exponent =
+                    std::min(exponent, ExactInteger::dyadic(source_rows[support[i]]->rhs).second -
+                                           exponents[i]);
+            for (const auto &v : vars) {
+                budget.checkpoint(1);
+                if (std::isfinite(v.lower))
+                    exponent = std::min(exponent, ExactInteger::dyadic(v.lower).second);
+                if (std::isfinite(v.upper))
+                    exponent = std::min(exponent, ExactInteger::dyadic(v.upper).second);
+            }
+            ExactInteger rhs, magnitude = ExactInteger(1).shifted(-exponent);
+            for (int i = 0; i < k; ++i) {
+                budget.checkpoint(64);
+                const auto part = ExactInteger::dyadic(source_rows[support[i]]->rhs);
+                const auto term = (weights[i] * ExactInteger(part.first))
+                                      .shifted(part.second - exponents[i] - exponent);
+                rhs = rhs + term;
+                magnitude = magnitude + term.absolute();
+            }
+            for (int j = 0; j < original_n; ++j) {
+                ExactInteger coefficient;
+                for (int i = 0; i < k; ++i) {
+                    budget.checkpoint(64);
+                    coefficient = coefficient + weights[i] * at(j, i);
+                }
+                if (coefficient.zero()) continue;
+                const double endpoint = coefficient.negative ? vars[j].upper : vars[j].lower;
+                if (!std::isfinite(endpoint)) return false;
+                const auto part = ExactInteger::dyadic(endpoint);
+                const auto term =
+                    (coefficient * ExactInteger(part.first)).shifted(part.second - exponent);
+                rhs = rhs - term;
+                magnitude = magnitude + term.absolute();
+            }
+            return rhs.negative &&
+                   ExactInteger::compare((-rhs) * ExactInteger(1000000000000LL), magnitude) > 0;
+        } catch (const ExactOverflow &) { return false; }
+    }
+
+    // Phase I の負の目的値だけで実行不能としない。非負の行乗数を
+    // 元係数に掛け、区間境界上の最小活動量より右辺が小さいことを確認する。
+    // 辞書の係数誤差で作られた見かけの矛盾を、探索の証拠に使わない。
+    bool verify_infeasible(int objective_row, Budget &budget,
+                           const std::vector<Variable> *enclosure = nullptr) const {
+        auto endpoint = [&](int j, double a) {
+            if (enclosure) return a < 0 ? (*enclosure)[j].upper : (*enclosure)[j].lower;
+            return location[j] == fixed_zero ? (reversed(j) ? upper[j] : 0) : a < 0 ? bound(j) : 0;
+        };
+        auto propagate_certificate = [&] {
+            if (enclosure) return exact_infeasible(objective_row, budget, *enclosure);
+            auto vars = budget.filled<Variable>(original_n, Variable{0, inf, VarType::Continuous});
+            for (int j = 0; j < original_n; ++j) {
+                vars[j].upper = bound(j);
+                if (location[j] == fixed_zero)
+                    vars[j].lower = vars[j].upper = reversed(j) ? upper[j] : 0;
+            }
+            std::vector<Row> rows;
+            rows.reserve(m);
+            for (int i = 0; i < m; ++i) {
+                rows.push_back(Row{budget.copy(source_rows[i]->terms), source_rows[i]->rhs});
+                if (location[original_n + i] == fixed_zero) {
+                    auto terms = budget.copy(source_rows[i]->terms);
+                    for (auto &term : terms) term.second = -term.second;
+                    rows.push_back(Row{std::move(terms), -source_rows[i]->rhs});
+                }
+            }
+            if (!propagate(rows, vars, budget, 8)) return true;
+            return verify_infeasible(objective_row, budget, &vars);
+        };
+        // 単一行と区間境界だけの矛盾も、正当な非負乗数の証拠になる。
+        for (const auto &row : source_rows) {
+            Accurate minimum;
+            double magnitude = 1 + std::abs(row->rhs);
+            bool finite = true;
+            for (auto [j, a] : row->terms) {
+                budget.checkpoint(1);
+                const double bound_value = endpoint(j, a);
+                if (!std::isfinite(bound_value)) {
+                    finite = false;
+                    break;
+                }
+                minimum = minimum + Accurate(a) * Accurate(bound_value);
+                magnitude += std::abs(a * bound_value);
+            }
+            if (finite && std::isfinite(minimum.value()) &&
+                (minimum - Accurate(row->rhs)).value() >
+                    budget.opt.feasibility_tolerance + 1e-12 * magnitude)
+                return true;
+        }
+        const double *z = row(objective_row);
+        double largest = 0;
+        auto weights = budget.filled<double>(m);
+        for (int i = 0; i < m; ++i) {
+            budget.checkpoint(1);
+            const int pos = location[original_n + i];
+            if (pos >= 0 && pos != fixed_zero && std::isfinite(z[pos]))
+                weights[i] = std::max(0.0, z[pos]);
+            else if (pos < 0 && -pos - 1 == objective_row)
+                weights[i] = 1;
+            largest = std::max(largest, weights[i]);
+        }
+        if (largest == 0) return propagate_certificate();
+        // 乗数の消去誤差が無上限変数に微小な負係数を作る場合がある。
+        // 微小な乗数を落とした別の証拠を試すが、毎回元の全係数で検証する。
+        // 合成後の負係数を0と見なしたり、変数の上限を仮定したりはしない。
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            const double cutoffs[] = {0., 1e-14, 1e-12, 1e-10, 0.};
+            const double cutoff = cutoffs[attempt];
+            if (attempt == 4) {
+                // 有理な乗数をdoubleに丸めると、相殺する列に負の残差が残る。
+                // 連分数で共通の整数倍率を提案し、丸めた証拠を元係数で再検証する。
+                auto numerators = budget.filled<long long>(m);
+                auto denominators = budget.filled<long long>(m, 1);
+                long long common = 1;
+                bool representable = true;
+                for (int i = 0; i < m; ++i) {
+                    budget.checkpoint(1);
+                    const double target = weights[i] / largest;
+                    if (target < 1e-12) continue;
+                    double value = target;
+                    long long h0 = 0, h1 = 1, k0 = 1, k1 = 0;
+                    bool found = false;
+                    for (int k = 0; k < 32 && value <= 1000000; ++k) {
+                        const auto integer = (long long)std::floor(value);
+                        const long long h = integer * h1 + h0, d = integer * k1 + k0;
+                        if (d > 1000000 || !d) break;
+                        if (std::abs(target - double(h) / d) < 1e-10) {
+                            numerators[i] = h;
+                            denominators[i] = d;
+                            found = true;
+                            break;
+                        }
+                        const double fraction = value - integer;
+                        if (fraction <= 0) break;
+                        value = 1 / fraction;
+                        h0 = h1;
+                        h1 = h;
+                        k0 = k1;
+                        k1 = d;
+                    }
+                    if (!found) {
+                        representable = false;
+                        break;
+                    }
+                    const auto factor = denominators[i] / std::gcd(common, denominators[i]);
+                    if (common > 1000000000000LL / factor) {
+                        representable = false;
+                        break;
+                    }
+                    common *= factor;
+                }
+                if (!representable) break;
+                for (int i = 0; i < m; ++i)
+                    weights[i] = double(numerators[i] * (common / denominators[i]));
+            }
+            auto coefficients = budget.filled<Accurate>(original_n);
+            auto absolute = budget.filled<double>(original_n);
+            Accurate rhs;
+            double magnitude = 1;
+            for (int i = 0; i < m; ++i) {
+                budget.checkpoint(1);
+                const double y = weights[i];
+                if (!std::isfinite(y)) return false;
+                if (y == 0 || y < cutoff * largest) continue;
+                const auto &source = *source_rows[i];
+                rhs = rhs + Accurate(y) * Accurate(source.rhs);
+                magnitude += std::abs(y * source.rhs);
+                for (auto [j, coefficient] : source.terms) {
+                    budget.checkpoint(1);
+                    coefficients[j] = coefficients[j] + Accurate(y) * Accurate(coefficient);
+                    absolute[j] += std::abs(y * coefficient);
+                }
+            }
+            bool bounded = true;
+            for (int j = 0; j < original_n; ++j) {
+                budget.checkpoint(1);
+                const double coefficient = coefficients[j].value();
+                if (!std::isfinite(coefficient)) return false;
+                const double bound_value = endpoint(j, coefficient);
+                if (!std::isfinite(bound_value)) {
+                    bounded = false;
+                    break;
+                }
+                rhs = rhs - coefficients[j] * Accurate(bound_value);
+                magnitude += absolute[j] * std::abs(bound_value);
+            }
+            if (bounded && std::isfinite(rhs.value()) && std::isfinite(magnitude) &&
+                rhs.value() < -1e-12 * magnitude)
+                return true;
+        }
+        return propagate_certificate();
+    }
+
+    // 任意の正しい辞書から実行可能性を回復する。違反行だけに人工列を置き、
+    // 人工変数を最大違反量にすると全ての基本変数が境界上になるようにする。
+    // 有限上限がある基底でも、Phase I の開始点が実行可能となる。
+    Status reoptimize(Budget &budget, int repair_attempts = 0) {
+        if (budget.stop()) return Status::Limit;
+        primal_feasible = false;
+        int r = -1, artificial = -1;
+        double violation = 0;
+        for (int j = 0; j <= n; ++j)
+            if (nonbasic[j] == -1) artificial = j;
+        if (artificial < 0) return Status::NumericalError;
+        for (int i = 0; i < m; ++i) {
+            budget.checkpoint(1);
+            if (coefficient(i, n + 1) > bound(basic[i])) reverse_basic(i, budget);
+            if (coefficient(i, n + 1) < -violation) {
+                violation = -coefficient(i, n + 1);
+                r = i;
+            }
+        }
+        if (r >= 0 && violation > budget.opt.pivot_tolerance) {
+            for (int i = 0; i < m; ++i) {
+                double *q = write_row(i, &budget);
+                q[artificial] = std::min(0.0, q[n + 1]) / violation;
+            }
+            double *z = write_row(m + 1, &budget);
+            std::fill(z, z + stride, 0);
+            z[artificial] = 1;
+            write_row(m, &budget)[artificial] = 0;
+            pivot(r, artificial, budget);
+            Status status = primal(m + 1, budget, false);
+            if (status != Status::Optimal) return status;
+            if (coefficient(m + 1, n + 1) < -budget.opt.feasibility_tolerance) {
+                if (verify_infeasible(m + 1, budget)) return Status::Infeasible;
+                if (budget.opt.basis_repair && repair_attempts < 2 && refactor(budget, true)) {
+                    Options reliable = budget.opt;
+                    reliable.dual_devex = false;
+                    Budget retry{reliable, budget.stats, budget.start};
+                    return reoptimize(retry, repair_attempts + 1);
+                }
+                return Status::NumericalError;
+            }
+            for (int i = 0; i < m; ++i)
+                if (basic[i] == -1) {
+                    int s = -1;
+                    double largest = 0;
+                    nonzeros(i, [&](int j, double a) {
+                        if (j <= n && nonbasic[j] >= 0 && std::abs(a) > largest) {
+                            s = j;
+                            largest = std::abs(a);
+                        }
+                    });
+                    if (s < 0 || largest <= budget.opt.pivot_tolerance) {
+                        // 冗長行に残った人工変数は微小係数で無理にpivotせず、
+                        // 元の列とslackから独立な基底を作る。
+                        if (repair_attempts >= 2 || !refactor(budget, true))
+                            return Status::NumericalError;
+                        return reoptimize(budget, repair_attempts + 1);
+                    }
+                    pivot(i, s, budget);
+                }
+        }
+        if (!restore_objective(budget)) return Status::NumericalError;
+        primal_feasible = true;
+        return primal(m, budget, false);
+    }
+
+    // 修復した基底でも残差が消えないときは、同じ制約・固定を初期基底から解く。
+    // この再試行では再帰的な修復を無効にし、総時間と反復数をそのまま引き継ぐ。
+    Status restart_basis(Budget &budget) {
+        if (!source_cost) return Status::NumericalError;
+        needs_repair = true;
+        if (budget.stop()) return Status::Limit;
+        std::vector<Terms> a;
+        std::vector<double> b;
+        a.reserve(m);
+        b.reserve(m);
+        for (int i = 0; i < m; ++i) {
+            a.push_back(budget.copy(source_rows[i]->terms));
+            b.push_back(source_rows[i]->rhs);
+        }
+        for (int i = 0; i < m; ++i)
+            if (location[original_n + i] == fixed_zero) {
+                auto terms = budget.copy(source_rows[i]->terms);
+                for (auto &term : terms) term.second = -term.second;
+                a.push_back(std::move(terms));
+                b.push_back(-source_rows[i]->rhs);
+            }
+        auto bounds = upper.empty() ? budget.filled<double>(original_n, inf) : budget.copy(upper);
+        for (int j = 0; j < original_n; ++j)
+            if (location[j] == fixed_zero) {
+                if (reversed(j)) {
+                    a.push_back(Terms{{j, -1}});
+                    b.push_back(-upper[j]);
+                } else
+                    bounds[j] = 0;
+            }
+        Options reliable = budget.opt;
+        reliable.basis_repair = false;
+        reliable.dual_devex = false;
+        Budget retry{reliable, budget.stats, budget.start};
+        Tableau fresh(a, b, *source_cost, &retry, bounds);
+        // 追加した等式のslackについて、外部のstep配列には刻みがない。
+        fresh.slack_fixing = slack_fixing && a.size() == std::size_t(m);
+        ++budget.stats.numerical_restarts;
+        Status status = fresh.solve(retry);
+        if (status == Status::Optimal && !fresh.consistent(retry)) status = Status::NumericalError;
+        fresh.needs_repair = status != Status::Optimal;
+        *this = std::move(fresh);
+        return status;
+    }
+
+    Status recover_basis(Budget &budget, int max_pivots = std::numeric_limits<int>::max()) {
+        if (!budget.opt.basis_repair) return Status::NumericalError;
+        needs_repair = true;
+        if (max_pivots <= 0 || budget.stop()) return Status::Limit;
+        stable_ratio = true;
+        Options local = budget.opt;
+        // 行の縮尺で増幅された違反を、復旧時だけ細かいpivot・Phase I判定で扱う。
+        local.pivot_tolerance = std::min(local.pivot_tolerance, 1e-13);
+        local.feasibility_tolerance = std::min(local.feasibility_tolerance, local.pivot_tolerance);
+        local.iteration_limit =
+            budget.stats.pivots +
+            std::min(std::uint64_t(std::max(0, max_pivots)),
+                     local.iteration_limit - std::min(local.iteration_limit, budget.stats.pivots));
+        Budget recovery{local, budget.stats, budget.start};
+        if (!refactor(recovery, true)) return restart_basis(recovery);
+        Status status = reoptimize(recovery);
+        if (status == Status::Optimal && !consistent(recovery)) status = Status::NumericalError;
+        needs_repair = status != Status::Optimal;
+        return status == Status::NumericalError ? restart_basis(recovery) : status;
     }
 
     Status solve(Budget &budget) {
         if (budget.stop()) return Status::Limit;
         int r = -1;
         for (int i = 0; i < m; ++i)
-            if (r < 0 || row(i)[n + 1] < row(r)[n + 1]) r = i;
-        if (r >= 0 && row(r)[n + 1] < -budget.opt.pivot_tolerance) {
+            if (r < 0 || coefficient(i, n + 1) < coefficient(r, n + 1)) r = i;
+        if (r >= 0 && coefficient(r, n + 1) < -budget.opt.pivot_tolerance) {
             // 最小費用フローや被覆では、slack 基底が既に双対実行可能。
             // 人工変数で全行を混ぜる Phase I を省き、直接実行可能性を回復する。
             bool dual_feasible = true;
             for (int j = 0; j <= n; ++j)
                 if (nonbasic[j] != -1 && row(m)[j] < 0) dual_feasible = false;
-            if (dual_feasible) return dual(budget);
+            if (dual_feasible) {
+                auto violation = [&] {
+                    double sum = 0;
+                    for (int i = 0; i < m; ++i) {
+                        budget.checkpoint(1);
+                        const double rhs = coefficient(i, n + 1);
+                        sum += std::max(0.0, std::max(-rhs, rhs - bound(basic[i])));
+                    }
+                    return sum;
+                };
+                double initial = violation();
+                Status status = dual(budget, 256, true);
+                if (status != Status::Limit || budget.stop()) return status;
+                if (!stable_ratio || violation() < .5 * initial)
+                    return dual(budget, std::numeric_limits<int>::max(), true);
+                // 退化した初期双対法だけに小さい正の摂動を加える。
+                // 終了後は原係数から真の目的を復元し、主単体法で最適化し直す。
+                // 摂動した目的の境界を証明用の探索へ渡してはならない。
+                double *z = write_row(m, &budget);
+                for (int j = 0; j <= n; ++j)
+                    if (nonbasic[j] >= 0)
+                        z[j] += 1e-6 * (1 + ((unsigned(nonbasic[j]) * 2654435761U) >> 16) / 65536.0);
+                perturbed = true;
+                ++budget.stats.objective_perturbations;
+                status = dual(budget, std::numeric_limits<int>::max(), true);
+                perturbed = false;
+                if (status != Status::Optimal) return status;
+                if (!refactor(budget)) return recover_basis(budget);
+                primal_feasible = true;
+                return primal(m, budget);
+            }
             pivot(r, n, budget);
             Status s = primal(m + 1, budget);
             if (s == Status::Limit || s == Status::NumericalError) return s;
             if (s != Status::Optimal) return Status::NumericalError;
-            if (row(m + 1)[n + 1] < -budget.opt.pivot_tolerance) return Status::Infeasible;
+            // 人工目的の零判定は実行可能性の許容誤差で行う。pivot の選択用の
+            // 小さい閾値では、消去の丸め残差だけで可解な問題を実行不能にしてしまう。
+            if (row(m + 1)[n + 1] < -budget.opt.feasibility_tolerance) {
+                if (verify_infeasible(m + 1, budget)) return Status::Infeasible;
+                return recover_basis(budget);
+            }
             for (int i = 0; i < m; ++i)
                 if (basic[i] == -1) {
                     int jbest = -1;
-                    for (int j = 0; j <= n; ++j)
-                        if (nonbasic[j] != -1 && std::abs(row(i)[j]) > budget.opt.pivot_tolerance &&
-                            (jbest < 0 || std::abs(row(i)[j]) > std::abs(row(i)[jbest])))
+                    nonzeros(i, [&](int j, double a) {
+                        if (j <= n && nonbasic[j] != -1 && std::abs(a) > budget.opt.pivot_tolerance &&
+                            (jbest < 0 || std::abs(a) > std::abs(coefficient(i, jbest)) ||
+                             (std::abs(a) == std::abs(coefficient(i, jbest)) && j < jbest)))
                             jbest = j;
+                    });
                     if (jbest >= 0) pivot(i, jbest, budget);
                 }
         }
@@ -414,8 +1783,7 @@ struct Tableau {
 
     std::vector<double> solution() const {
         std::vector<double> x(original_n);
-        for (int j = 0; j < original_n; ++j)
-            if (location[j] < 0) x[j] = row(-location[j] - 1)[n + 1];
+        for (int j = 0; j < original_n; ++j) x[j] = coordinate(j);
         return x;
     }
 
@@ -431,7 +1799,8 @@ struct Tableau {
         for (int j = 0; j <= n; ++j) {
             budget.checkpoint(1);
             const int id = nonbasic[j];
-            if (id >= 0 && step[id] > 0 && z[j] / objective_scale * step[id] > gap + margin)
+            if (id >= 0 && (slack_fixing || id < original_n) && step[id] > 0 &&
+                z[j] / objective_scale * step[id] > gap + margin)
                 pivot_columns.push_back(j);
         }
         const int removed = int(pivot_columns.size());
@@ -449,23 +1818,50 @@ struct Tableau {
                 keep.push_back(j);
         }
         const int width = int(keep.size()) + 1;
+        std::vector<std::shared_ptr<SparseRow>> compact_sparse;
+        std::uint64_t compact_bytes = 0;
         std::vector<std::shared_ptr<std::vector<double>>> compact;
         std::vector<double> compact_dense;
-        if (width < 128)
-            compact_dense = budget.filled<double>(std::size_t(m + 2) * width);
-        else
-            compact.reserve(m + 2);
-        for (int i = 0; i < m + 2; ++i) {
-            auto values = width < 128 ? std::vector<double>{} : budget.filled<double>(width);
-            double *dest =
-                width < 128 ? compact_dense.data() + std::size_t(i) * width : values.data();
-            const double *source = row(i);
-            budget.chunks(keep.size(), [&](std::size_t begin, std::size_t end) {
-                for (auto j = begin; j < end; ++j) dest[j] = source[keep[j]];
-            });
-            dest[width - 1] = source[n + 1];
-            if (width >= 128)
-                compact.push_back(std::make_shared<std::vector<double>>(std::move(values)));
+        if (!sparse_rows.empty()) {
+            auto remap = budget.filled<int>(stride, -1);
+            for (int j = 0; j < int(keep.size()); ++j) remap[keep[j]] = j;
+            remap[n + 1] = width - 1;
+            compact_sparse.reserve(m + 2);
+            for (int i = 0; i < m + 2; ++i) {
+                auto next = std::make_shared<SparseRow>();
+                Terms entries;
+                nonzeros(i, [&](int j, double a) {
+                    budget.checkpoint(1);
+                    if (remap[j] >= 0) entries.emplace_back(remap[j], a);
+                });
+                if (i >= m || entries.size() * 8 > std::size_t(width)) {
+                    next->full = budget.filled<double>(width);
+                    for (auto [j, a] : entries) next->full[j] = a;
+                } else {
+                    next->rhs_column = width - 1;
+                    next->reserve(int(entries.size()), &budget);
+                    for (auto [j, a] : entries) next->set(j, a);
+                }
+                compact_bytes += next->bytes();
+                compact_sparse.push_back(std::move(next));
+            }
+        } else {
+            if (width < 128)
+                compact_dense = budget.filled<double>(std::size_t(m + 2) * width);
+            else
+                compact.reserve(m + 2);
+            for (int i = 0; i < m + 2; ++i) {
+                auto values = width < 128 ? std::vector<double>{} : budget.filled<double>(width);
+                double *dest =
+                    width < 128 ? compact_dense.data() + std::size_t(i) * width : values.data();
+                const double *source = row(i);
+                budget.chunks(keep.size(), [&](std::size_t begin, std::size_t end) {
+                    for (auto j = begin; j < end; ++j) dest[j] = source[keep[j]];
+                });
+                dest[width - 1] = source[n + 1];
+                if (width >= 128)
+                    compact.push_back(std::make_shared<std::vector<double>>(std::move(values)));
+            }
         }
         std::vector<int> columns;
         columns.reserve(keep.size());
@@ -474,6 +1870,8 @@ struct Tableau {
             if (id >= 0) positions[id] = int(columns.size());
             columns.push_back(id);
         }
+        sparse_rows = std::move(compact_sparse);
+        sparse_bytes = compact_bytes;
         data = std::move(compact);
         dense = std::move(compact_dense);
         nonbasic = std::move(columns);
@@ -486,11 +1884,52 @@ struct Tableau {
     // 最適辞書に a*x <= rhs を追加。目的行の双対実行可能性は保存される。
     template <class Coefficients = Terms>
     void add_constraint(const Coefficients &a, double rhs, Budget *budget = nullptr,
-                        double multiplier = 1) {
+                        double multiplier = 1, bool oriented = false) {
+        Row origin;
+        origin.rhs = rhs;
+        bool slacks = false;
+        for (const auto &term : a) slacks |= term.first >= original_n;
+        if (!slacks) {
+            for (const auto &term : a) {
+                if (budget) budget->checkpoint(1);
+                double v = term.second * multiplier;
+                if (oriented && reversed(term.first)) {
+                    origin.rhs -= v * upper[term.first];
+                    v = -v;
+                }
+                origin.terms.emplace_back(term.first, v);
+            }
+        } else {
+            std::vector<Accurate> coefficients(original_n);
+            Accurate b(rhs);
+            for (const auto &term : a) {
+                if (budget) budget->checkpoint(1);
+                const int id = term.first;
+                const double v = term.second * multiplier;
+                if (id < original_n) {
+                    if (oriented && reversed(id)) {
+                        b = b - Accurate(v) * Accurate(upper[id]);
+                        coefficients[id] = coefficients[id] - Accurate(v);
+                    } else
+                        coefficients[id] = coefficients[id] + Accurate(v);
+                } else {
+                    const auto &row = *source_rows[id - original_n];
+                    b = b - Accurate(v) * Accurate(row.rhs);
+                    for (auto [j, c] : row.terms) {
+                        if (budget) budget->checkpoint(1);
+                        coefficients[j] = coefficients[j] - Accurate(v) * Accurate(c);
+                    }
+                }
+            }
+            origin.rhs = b.value();
+            for (int j = 0; j < original_n; ++j)
+                if (coefficients[j].value()) origin.terms.emplace_back(j, coefficients[j].value());
+        }
+        auto saved = std::make_shared<const Row>(std::move(origin));
         primal_feasible = false;
         // 時間割込みのない狭い辞書では、追加先に直接組み立てて一時行を省く。
         // budget ありの場合は従来通り、完成した行だけを辞書へ追加する。
-        const bool inplace = data.empty() && !budget;
+        const bool inplace = sparse_rows.empty() && data.empty() && !budget;
         std::vector<double> buffer;
         double *q;
         if (inplace) {
@@ -506,12 +1945,21 @@ struct Tableau {
         for (const auto &term : a) {
             if (budget) budget->checkpoint(1);
             const int var = term.first;
-            const double coef = term.second * multiplier;
+            double coef = term.second * multiplier;
+            if (!oriented && reversed(var)) {
+                q[n + 1] -= coef * upper[var];
+                coef = -coef;
+            }
             const int pos = location[var];
             if (pos == fixed_zero) continue;
             if (pos >= 0)
                 q[pos] += coef;
-            else {
+            else if (!sparse_rows.empty()) {
+                nonzeros(-pos - 1, [&](int j, double v) {
+                    if (budget) budget->checkpoint(1);
+                    q[j] -= coef * v;
+                });
+            } else {
                 const double *p = row(-pos - 1);
                 auto subtract = [&](std::size_t begin, std::size_t end) {
                     for (auto j = begin; j < end; ++j) q[j] -= coef * p[j];
@@ -522,48 +1970,159 @@ struct Tableau {
                     subtract(0, stride);
             }
         }
-        if (data.empty() && !inplace) {
+        if (!sparse_rows.empty()) {
+            auto next = std::make_shared<SparseRow>();
+            initialize_row(*next, sparse_coefficients(buffer, budget), budget);
+            sparse_bytes += next->bytes();
+            sparse_rows.insert(sparse_rows.begin() + m, std::move(next));
+        } else if (data.empty() && !inplace) {
             dense.resize(std::size_t(m + 3) * stride);
             std::copy_backward(write_row(m), write_row(m + 2), write_row(m + 3));
             std::copy(buffer.begin(), buffer.end(), write_row(m));
         } else if (!data.empty())
             data.insert(data.begin() + m, std::make_shared<std::vector<double>>(std::move(buffer)));
+        source_rows.push_back(std::move(saved));
         basic.push_back(next_id++);
         location.push_back(-m - 1);
         ++m;
     }
 
-    Status dual(Budget &budget, int max_pivots = std::numeric_limits<int>::max()) {
+    Status
+    dual(Budget &budget, int max_pivots = std::numeric_limits<int>::max(), bool initial = false) {
+        // 中断したPhase I/主単体法の辞書は、双対実行可能とは限らない。
+        if (!perturbed && !dual_feasible(10 * budget.opt.pivot_tolerance)) {
+            if (needs_repair || !restore_objective(budget) ||
+                !dual_feasible(10 * budget.opt.pivot_tolerance))
+                return recover_basis(budget, max_pivots);
+        }
         const double eps = budget.opt.pivot_tolerance;
-        int iter = 0;
+        const double feasibility = budget.opt.feasibility_tolerance;
+        int iter = 0, repairs = 0, stagnant = 0;
+        double best_violation = inf;
+        const bool weighted = initial && budget.opt.dual_devex && m >= 32 && n >= 16;
+        std::vector<double> weights;
+        std::vector<unsigned char> reference;
+        int framework_age = 0;
+        auto reset_weights = [&] {
+            weights = budget.filled<double>(m, 1);
+            reference = budget.filled<unsigned char>(next_id);
+            for (int id : basic)
+                if (id >= 0) reference[id] = 1;
+            framework_age = 0;
+        };
+        if (weighted) reset_weights();
+        bool fresh_basis = false;
         int degenerate = 0;
         bool bland = false;
         while (true) {
             if (budget.stop()) return Status::Limit;
             int r = -1;
-            for (int i = 0; i < m; ++i)
-                if (row(i)[n + 1] < -eps &&
-                    (r < 0 || (bland ? basic[i] < basic[r] : row(i)[n + 1] < row(r)[n + 1])))
+            double best_merit = 0, total_violation = 0;
+            bool upper_leaves = false;
+            auto consider = [&](int i, double rhs) {
+                const double upper_slack = bound(basic[i]) - rhs;
+                const double violation = std::min(rhs, upper_slack);
+                total_violation += std::max(0.0, -violation);
+                const double merit = weighted ? -violation / std::sqrt(weights[i]) : -violation;
+                if (violation < -eps &&
+                    (r < 0 || (bland ? basic[i] < basic[r] : merit > best_merit))) {
+                    // 行の縮尺を元に戻すと微小な違反も増幅するため、修復できるなら続ける。
+                    // 入る列がない場合だけ、許容幅内の丸め残差を実行不能の証拠にしない。
+                    if (violation >= -feasibility) {
+                        bool repairable = false;
+                        budget.checkpoint(std::size_t(n) + 2);
+                        nonzeros(i, [&](int j, double a) {
+                            if (j <= n && nonbasic[j] != -1 &&
+                                (upper_slack < rhs ? a > eps : a < -eps))
+                                repairable = true;
+                        });
+                        if (!repairable) return;
+                    }
                     r = i;
+                    best_merit = merit;
+                    upper_leaves = upper_slack < rhs;
+                }
+            };
+            if (sparse_rows.empty()) {
+                for (int i = 0; i < m; ++i) consider(i, dense_row(i)[n + 1]);
+            } else
+                for (int i = 0; i < m; ++i) consider(i, coefficient(i, n + 1));
             if (r < 0) {
+                if (!consistent(budget)) {
+                    stable_ratio = true;
+                    if (++repairs > 3 || !refactor(budget))
+                        return recover_basis(budget, max_pivots - iter);
+                    continue;
+                }
                 primal_feasible = true;
+                if (!dual_feasible(10 * eps)) {
+                    // RHSだけが一致していてもreduced costには誤差が残り得る。
+                    // 誤差を含む目的を最適化せず、先に真の目的を再構築する。
+                    if (!perturbed && !restore_objective(budget)) return Status::NumericalError;
+                    Options local;
+                    local.dual_devex = budget.opt.dual_devex;
+                    local.basis_repair = budget.opt.basis_repair;
+                    local.time_limit = budget.opt.time_limit;
+                    local.pivot_tolerance = eps;
+                    local.sparse_tableau = budget.opt.sparse_tableau;
+                    local.iteration_limit =
+                        budget.stats.pivots +
+                        std::min(std::uint64_t(std::max(0, max_pivots - iter)),
+                                 budget.opt.iteration_limit -
+                                     std::min(budget.opt.iteration_limit, budget.stats.pivots));
+                    Budget cleanup{local, budget.stats, budget.start};
+                    const Status status = primal(m, cleanup);
+                    if (status == Status::Optimal && !consistent(budget))
+                        return recover_basis(cleanup);
+                    return status;
+                }
                 return Status::Optimal;
             }
             if (iter++ >= max_pivots) return Status::Limit;
+            if (total_violation < best_violation * (1 - 1e-8)) {
+                best_violation = total_violation;
+                stagnant = 0;
+            } else
+                ++stagnant;
+            if (budget.opt.basis_repair && !perturbed && stagnant > std::max(64, m + n))
+                return recover_basis(budget, max_pivots - iter);
+            if (upper_leaves) reverse_basic(r, budget);
             int s = -1;
-            double ratio = inf;
-            const double *q = row(r);
+            double ratio = inf, largest = 0, relaxed = inf;
             const double *z = row(m);
+            const double *q = row(r);
+            if (stable_ratio && !bland)
+                for (int j = 0; j <= n; ++j) {
+                    if (nonbasic[j] != -1 && q[j] < -eps)
+                        relaxed = std::min(relaxed, (std::max(0.0, z[j]) + eps) / -q[j]);
+                }
             for (int j = 0; j <= n; ++j) {
-                if (nonbasic[j] == -1 || q[j] >= -eps) continue;
-                const double v = std::max(0.0, z[j]) / -q[j];
-                if (v < ratio - eps ||
-                    (std::abs(v - ratio) <= eps && (s < 0 || nonbasic[j] < nonbasic[s]))) {
+                const double a = q[j];
+                if (nonbasic[j] == -1 || a >= -eps) continue;
+                const double v = std::max(0.0, z[j]) / -a;
+                if ((!stable_ratio || bland) ? ((bland ? v < ratio : v < ratio - eps) ||
+                                                ((bland ? v == ratio : std::abs(v - ratio) <= eps) &&
+                                                 (s < 0 || nonbasic[j] < nonbasic[s])))
+                                             : (v <= relaxed && (s < 0 || -a > largest))) {
                     s = j;
                     ratio = v;
+                    largest = -a;
                 }
             }
-            if (s < 0) return Status::Infeasible;
+            if (s < 0) {
+                if (verify_infeasible(r, budget)) return Status::Infeasible;
+                if (++repairs > 3 || !refactor(budget))
+                    return recover_basis(budget, max_pivots - iter);
+                fresh_basis = true;
+                stable_ratio = true;
+                continue;
+            }
+            if (!perturbed && !fresh_basis && std::abs(coefficient(r, s)) < 1e-7) {
+                fresh_basis = true;
+                stable_ratio = true;
+                if (!refactor(budget)) return recover_basis(budget, max_pivots - iter);
+                continue;
+            }
             if (ratio <= eps)
                 ++degenerate;
             else {
@@ -571,24 +2130,59 @@ struct Tableau {
                 bland = false;
             }
             if (degenerate > 32) bland = true;
+            if (weighted) {
+                // 参照基底の列だけで選択行の正確な辺長を求める。
+                // 他の行は既にあるpivot列からmax更新し、追加の線形方程式を解かない。
+                double exact = basic[r] >= 0 ? reference[basic[r]] : 0;
+                nonzeros(r, [&](int j, double a) {
+                    budget.checkpoint(1);
+                    if (j <= n && nonbasic[j] >= 0 && reference[nonbasic[j]]) exact += a * a;
+                });
+                exact = std::max(1.0, exact);
+                if (!std::isfinite(exact) || exact > 4 * weights[r] || weights[r] > 4 * exact ||
+                    framework_age >= m) {
+                    reset_weights();
+                    exact = 1;
+                }
+                const double pivot_value = coefficient(r, s);
+                const double next_weight = exact / (pivot_value * pivot_value);
+                for (int i = 0; i < m; ++i) {
+                    budget.checkpoint(1);
+                    const double a = coefficient(i, s);
+                    weights[i] = std::max(weights[i], next_weight * a * a);
+                }
+                weights[r] = std::max(1.0, next_weight);
+                ++framework_age;
+            }
             pivot(r, s, budget);
+            fresh_basis = false;
             if (!std::isfinite(value())) return Status::NumericalError;
         }
     }
 };
 
-// 元変数は固定・平行移動・反転・自由変数の分割のいずれかで、対応は高々2項。
-// 可変長配列を変数ごとに確保せず、根の保存・復元でもまとめてコピーする。
+// 通常の変数変換は高々2項を直接保持。等式代入で長くなる式だけ共有配列に置く。
 struct Mapping {
     struct Columns {
         std::pair<int, double> entries[2];
         int count = 0;
-        auto begin() const { return entries; }
-        auto end() const { return entries + count; }
+        std::shared_ptr<const Terms> expanded;
+        const std::pair<int, double> *begin() const {
+            return expanded ? expanded->data() : entries;
+        }
+        const std::pair<int, double> *end() const { return begin() + count; }
         int size() const { return count; }
         bool empty() const { return count == 0; }
-        const auto &operator[](int j) const { return entries[j]; }
+        const auto &operator[](int j) const { return begin()[j]; }
         void emplace_back(int j, double a) { entries[count++] = {j, a}; }
+        void assign(Terms a) {
+            count = int(a.size());
+            if (count <= 2) {
+                expanded.reset();
+                std::copy(a.begin(), a.end(), entries);
+            } else
+                expanded = std::make_shared<const Terms>(std::move(a));
+        }
     } terms;
     double offset = 0;
 };
@@ -612,17 +2206,20 @@ struct Prepared {
     std::vector<Row> rows;
     std::vector<Mapping> map;
     ImmutableRows a;
-    std::vector<double> b, c;
+    std::vector<double> b, c, upper;
     double offset = 0;
     bool infeasible = false;
+    int substitutions = 0;
     Prepared clone(Budget &budget) const {
         Prepared p;
         p.vars = budget.copy(vars);
         p.map = budget.copy(map);
         p.b = budget.copy(b);
         p.c = budget.copy(c);
+        p.upper = budget.copy(upper);
         p.offset = offset;
         p.infeasible = infeasible;
+        p.substitutions = substitutions;
         p.a.rows = budget.copy(a.rows);
         // rows は前処理だけで使う作業領域。保存・再求解には不要。
         return p;
@@ -679,9 +2276,13 @@ inline int gomory_cuts(Tableau &tab, Prepared &p, const std::vector<bool> &integ
         for (const auto &term : cut.terms) {
             const int id = term.first;
             const double coef = term.second;
-            if (id < tab.original_n)
-                a[id] += coef;
-            else {
+            if (id < tab.original_n) {
+                if (tab.reversed(id)) {
+                    rhs -= (long double)coef * tab.upper[id];
+                    a[id] -= coef;
+                } else
+                    a[id] += coef;
+            } else {
                 const int r = id - tab.original_n;
                 rhs -= (long double)coef * p.b[r];
                 budget.chunks(p.a[r].size(), [&](std::size_t begin, std::size_t end) {
@@ -704,7 +2305,7 @@ inline int gomory_cuts(Tableau &tab, Prepared &p, const std::vector<bool> &integ
         if (!std::isfinite(double(rhs)) || !std::isfinite(max_abs) || max_abs > 1e8) continue;
         p.a.push_terms(std::move(coefficients));
         p.b.push_back(double(rhs));
-        tab.add_constraint(cut.terms, -1 + 1e-8);
+        tab.add_constraint(cut.terms, -1 + 1e-8, nullptr, 1, true);
         ++added;
     }
     return added;
@@ -770,6 +2371,336 @@ inline bool propagate(const std::vector<Row> &rows, std::vector<Variable> &vars,
     }
     return true;
 }
+
+// 変わった境界を含む行だけを再検査する。作業上限で止めても、得た境界は有効。
+// 仮固定では同じ索引を再利用し、元の境界は変更しない。
+struct Propagation {
+    const std::vector<Row> &rows;
+    std::vector<std::vector<int>> incidence;
+    std::vector<int> queue;
+    std::vector<unsigned char> queued;
+    std::uint64_t size = 0, changes = 0;
+    Propagation(const std::vector<Row> &r, std::size_t n, Budget &budget) : rows(r) {
+        incidence = budget.filled<std::vector<int>>(n);
+        queued = budget.filled<unsigned char>(r.size());
+        for (int i = 0; i < int(r.size()); ++i) {
+            budget.checkpoint(1);
+            size += 1 + r[i].terms.size();
+            for (auto [j, a] : r[i].terms) {
+                budget.checkpoint(1);
+                (void)a;
+                incidence[j].push_back(i);
+            }
+        }
+    }
+    bool run(std::vector<Variable> &vars, Budget &budget, std::uint64_t &work, int seed = -1) {
+        queue.clear();
+        budget.chunks(queued.size(), [&](std::size_t a, std::size_t b) {
+            std::fill(queued.begin() + a, queued.begin() + b, 0);
+        });
+        auto enqueue = [&](int i) {
+            if (!queued[i]) {
+                queued[i] = 1;
+                queue.push_back(i);
+            }
+        };
+        if (seed < 0)
+            for (int i = 0; i < int(rows.size()); ++i) {
+                budget.checkpoint(1);
+                enqueue(i);
+            }
+        else
+            for (int i : incidence[seed]) {
+                budget.checkpoint(1);
+                enqueue(i);
+            }
+        const auto &opt = budget.opt;
+        for (std::size_t head = 0; head < queue.size() && work; ++head) {
+            const int i = queue[head];
+            queued[i] = 0;
+            const Row &row = rows[i];
+            const auto cost = 1 + row.terms.size();
+            if (cost > work) break;
+            work -= cost;
+            budget.checkpoint(1);
+            long double sum = 0, magnitude = std::abs(row.rhs);
+            int infinite = 0;
+            for (auto [j, a] : row.terms) {
+                budget.checkpoint(1);
+                if (a == 0) continue;
+                const double b = a > 0 ? vars[j].lower : vars[j].upper;
+                if (std::isfinite(b)) {
+                    sum += (long double)a * b;
+                    magnitude += std::abs((long double)a * b);
+                } else
+                    ++infinite;
+            }
+            if (!infinite &&
+                sum > (long double)row.rhs + opt.feasibility_tolerance + 1e-12L * magnitude)
+                return false;
+            for (auto [j, a] : row.terms) {
+                budget.checkpoint(1);
+                if (a == 0) continue;
+                auto &v = vars[j];
+                const double old = a > 0 ? v.lower : v.upper;
+                const bool finite = std::isfinite(old);
+                if (infinite - !finite) continue;
+                const long double other = sum - (finite ? (long double)a * old : 0);
+                double b = double(((long double)row.rhs - other) / a);
+                if (!std::isfinite(b)) continue;
+                const bool lower = a < 0;
+                if (v.type != VarType::Continuous)
+                    b = bound_round(b, lower, opt.integrality_tolerance);
+                double &target = lower ? v.lower : v.upper;
+                if (!(lower ? b > target : b < target)) continue;
+                if (std::isfinite(target) && std::abs(b - target) <= 1e-10 * (1 + std::abs(b)))
+                    continue;
+                target = b;
+                ++changes;
+                if (v.lower > v.upper + opt.feasibility_tolerance) return false;
+                for (int next : incidence[j]) {
+                    budget.checkpoint(1);
+                    if (next != i) enqueue(next);
+                }
+            }
+        }
+        return true;
+    }
+};
+
+// 上側活動量Uを使う整数係数強化。delta=U-rhsより大きい整数変数の
+// 係数をdeltaへ縮める。最大側の端点では同じ式、それ以外の整数値では
+// その行が常に成立するので、整数実行可能集合を保つ。連続変数には適用しない。
+inline bool opposite_rows(const Row &a, const Row &b, Budget &budget) {
+    if (a.rhs != -b.rhs || a.terms.size() != b.terms.size()) return false;
+    for (std::size_t k = 0; k < a.terms.size(); ++k) {
+        budget.checkpoint(1);
+        if (a.terms[k].first != b.terms[k].first || a.terms[k].second != -b.terms[k].second)
+            return false;
+    }
+    return true;
+}
+
+inline bool strengthen(std::vector<Row> &rows, const std::vector<Variable> &vars, Budget &budget) {
+    bool changed = false;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        budget.checkpoint(1);
+        // 等式を片側ずつ強化すると、後段での変数消去の機会を失う。
+        if (i + 1 < rows.size() && opposite_rows(rows[i], rows[i + 1], budget)) {
+            ++i;
+            continue;
+        }
+        auto &row = rows[i];
+        Accurate maximum;
+        bool finite = true;
+        for (auto [j, a] : row.terms) {
+            budget.checkpoint(1);
+            const double b = a > 0 ? vars[j].upper : vars[j].lower;
+            if (!std::isfinite(b)) {
+                finite = false;
+                break;
+            }
+            maximum = maximum + Accurate(a) * Accurate(b);
+        }
+        if (!finite) continue;
+        const Accurate excess = maximum - Accurate(row.rhs);
+        double delta = excess.value();
+        if ((Accurate(delta) - excess).value() < 0) delta = std::nextafter(delta, inf);
+        if (!(delta > 0) || !std::isfinite(delta)) continue;
+        Accurate rhs(row.rhs);
+        bool row_changed = false;
+        for (auto &term : row.terms) {
+            budget.checkpoint(1);
+            const auto &v = vars[term.first];
+            const double a = term.second;
+            if (v.type == VarType::Continuous || v.lower == v.upper ||
+                std::abs(a) <= delta + 1e-10 * std::max(1.0, std::abs(a)))
+                continue;
+            const double next = std::copysign(delta, a), bound = a > 0 ? v.upper : v.lower;
+            rhs = rhs - (Accurate(a) - Accurate(next)) * Accurate(bound);
+            term.second = next;
+            row_changed = true;
+            ++budget.stats.strengthened_coefficients;
+        }
+        if (row_changed) {
+            row.rhs = rhs.value();
+            if ((Accurate(row.rhs) - rhs).value() < 0) row.rhs = std::nextafter(row.rhs, inf);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+inline bool
+remove_fixed_terms(std::vector<Row> &rows, const std::vector<Variable> &vars, Budget &budget) {
+    bool changed = false;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        budget.checkpoint(1);
+        // 右辺を外側へ丸めて等式を微小な区間に変えない。固定項は代入時に扱う。
+        if (i + 1 < rows.size() && opposite_rows(rows[i], rows[i + 1], budget)) {
+            ++i;
+            continue;
+        }
+        auto &row = rows[i];
+        Accurate rhs(row.rhs);
+        std::size_t count = 0;
+        for (auto [j, a] : row.terms) {
+            budget.checkpoint(1);
+            if (vars[j].lower == vars[j].upper) {
+                rhs = rhs - Accurate(a) * Accurate(vars[j].lower);
+                changed = true;
+            } else if (a)
+                row.terms[count++] = {j, a};
+        }
+        row.terms.resize(count);
+        row.rhs = rhs.value();
+        if ((Accurate(row.rhs) - rhs).value() < 0) row.rhs = std::nextafter(row.rhs, inf);
+        long long divisor = 0;
+        bool integral = true;
+        for (auto [j, a] : row.terms) {
+            budget.checkpoint(1);
+            if (vars[j].type == VarType::Continuous || std::abs(a) > 1e9 || a != std::round(a)) {
+                integral = false;
+                break;
+            }
+            divisor = std::gcd(divisor, (long long)std::llround(std::abs(a)));
+        }
+        if (integral && divisor) {
+            const double b = std::floor(row.rhs / divisor + budget.opt.integrality_tolerance);
+            changed |= b * divisor != row.rhs || divisor != 1;
+            row.rhs = b;
+            for (auto &term : row.terms) {
+                budget.checkpoint(1);
+                term.second /= divisor;
+            }
+        }
+    }
+    return changed;
+}
+
+// 0/1変数の両側の伝播結果の包絡だけを採用。片側の境界を大域境界にしない。
+inline bool probe(Propagation &propagation, std::vector<Row> &rows, std::vector<Variable> &vars,
+                  Budget &budget) {
+    Options local = budget.opt;
+    local.time_limit =
+        std::min(local.time_limit, budget.elapsed() + std::min(.02, local.time_limit * .05));
+    Budget trial_budget{local, budget.stats, budget.start};
+    try {
+        std::vector<int> candidates;
+        for (int j = 0; j < int(vars.size()); ++j) {
+            trial_budget.checkpoint(1);
+            if (vars[j].type != VarType::Continuous && vars[j].lower == 0 && vars[j].upper == 1 &&
+                !propagation.incidence[j].empty())
+                candidates.push_back(j);
+        }
+        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+            trial_budget.checkpoint(1);
+            const auto x = propagation.incidence[a].size(), y = propagation.incidence[b].size();
+            return x != y ? x > y : a < b;
+        });
+        std::uint64_t work = std::min<std::uint64_t>(2000000, 32 * propagation.size);
+        int failed = 0, tried = 0;
+        for (int j : candidates) {
+            if (!work || tried >= 128 || failed >= 16 || trial_budget.stop()) break;
+            if (vars[j].lower == vars[j].upper) continue;
+            ++tried;
+            auto low = trial_budget.copy(vars), high = trial_budget.copy(vars);
+            low[j].upper = 0;
+            high[j].lower = 1;
+            ++budget.stats.probing_trials;
+            bool ok0 = propagation.run(low, trial_budget, work, j);
+            ++budget.stats.probing_trials;
+            bool ok1 = propagation.run(high, trial_budget, work, j);
+            if (!ok0 && !ok1) return false;
+            bool changed = false;
+            // 片側が不可能なら、もう片側の推論をすべて使える。
+            for (int k = 0; k < int(vars.size()); ++k) {
+                trial_budget.checkpoint(1);
+                double l = !ok0   ? high[k].lower
+                           : !ok1 ? low[k].lower
+                                  : std::min(low[k].lower, high[k].lower);
+                double u = !ok0   ? high[k].upper
+                           : !ok1 ? low[k].upper
+                                  : std::max(low[k].upper, high[k].upper);
+                if (l > vars[k].lower || u < vars[k].upper) {
+                    vars[k].lower = std::max(vars[k].lower, l);
+                    vars[k].upper = std::min(vars[k].upper, u);
+                    ++budget.stats.probing_bound_changes;
+                    changed = true;
+                }
+            }
+            if (ok0 && ok1)
+                for (int i : propagation.incidence[j]) {
+                    trial_budget.checkpoint(1);
+                    if ((i > 0 && opposite_rows(rows[i - 1], rows[i], trial_budget)) ||
+                        (i + 1 < int(rows.size()) &&
+                         opposite_rows(rows[i], rows[i + 1], trial_budget)))
+                        continue;
+                    auto &row = rows[i];
+                    auto term = std::lower_bound(row.terms.begin(), row.terms.end(), j,
+                                                 [](const auto &t, int v) { return t.first < v; });
+                    if (term == row.terms.end() || term->first != j || term->second == 0) continue;
+                    const double a = term->second;
+                    const auto &implied = a > 0 ? low : high;
+                    Accurate activity;
+                    bool finite = true;
+                    for (auto [k, c] : row.terms) {
+                        trial_budget.checkpoint(1);
+                        if (k == j || c == 0) continue;
+                        double b = c > 0 ? implied[k].upper : implied[k].lower;
+                        if (!std::isfinite(b)) {
+                            finite = false;
+                            break;
+                        }
+                        activity = activity + Accurate(c) * Accurate(b);
+                    }
+                    if (!finite) continue;
+                    // x=0側（負係数ならx=1側）の含意境界で、行の余裕を証明する。
+                    // 反対側の式は不変に保ち、その余裕だけ係数を縮める。
+                    const Accurate slack = Accurate(row.rhs) - activity - Accurate(a < 0 ? a : 0);
+                    if (!(slack.value() > 1e-8 * std::max(1.0, std::abs(a)))) continue;
+                    Accurate reduced = a > 0 ? Accurate(a) - slack : Accurate(a) + slack;
+                    double next = reduced.value();
+                    if (a > 0) {
+                        if ((Accurate(next) - reduced).value() < 0)
+                            next = std::nextafter(next, inf);
+                        next = std::max(0.0, next);
+                    } else {
+                        if ((Accurate(next) - reduced).value() > 0)
+                            next = std::nextafter(next, -inf);
+                        next = std::min(0.0, next);
+                    }
+                    if (next == a) continue;
+                    if (a > 0) {
+                        const Accurate rhs = Accurate(row.rhs) - (Accurate(a) - Accurate(next));
+                        row.rhs = rhs.value();
+                        if ((Accurate(row.rhs) - rhs).value() < 0)
+                            row.rhs = std::nextafter(row.rhs, inf);
+                    }
+                    term->second = next;
+                    ++budget.stats.strengthened_coefficients;
+                    changed = true;
+                }
+            if (changed) {
+                failed = 0;
+                if (!propagation.run(vars, trial_budget, work)) return false;
+            } else
+                ++failed;
+        }
+    } catch (const TimeLimitReached &) { /* 局所予算が尽きても、確定した境界は使える。 */
+    }
+    for (auto &row : rows) {
+        budget.checkpoint(1);
+        row.terms.erase(std::remove_if(row.terms.begin(), row.terms.end(),
+                                       [&](auto t) {
+                                           budget.checkpoint(1);
+                                           return t.second == 0;
+                                       }),
+                        row.terms.end());
+    }
+    budget.checkpoint();
+    return true;
+}
 } // namespace detail
 
 class Model {
@@ -782,11 +2713,18 @@ class Model {
         detail::Prepared prepared;
         detail::Tableau tableau;
         std::size_t rows = 0;
-        bool presolve = false, scaling = false, dualize = false, relax = false;
+        bool presolve = false, advanced = false, probing = false, integer_substitution = false,
+             substitution = false;
+        bool scaling = false, dualize = false, relax = false, bounded = false;
+        int sparse_mode = -1;
         double feasibility = 0, integrality = 0, pivot = 0;
         bool matches(const Options &o, bool r) const {
-            return presolve == o.presolve && scaling == o.scaling && dualize == o.dualize &&
-                   relax == r && feasibility == o.feasibility_tolerance &&
+            return presolve == o.presolve && advanced == o.advanced_presolve &&
+                   probing == o.probing && integer_substitution == o.integer_substitution &&
+                   substitution == o.equality_substitution && scaling == o.scaling &&
+                   dualize == o.dualize && bounded == o.bounded_variables &&
+                   sparse_mode == o.sparse_tableau && relax == r &&
+                   feasibility == o.feasibility_tolerance &&
                    integrality == o.integrality_tolerance && pivot == o.pivot_tolerance;
         }
     };
@@ -817,8 +2755,145 @@ class Model {
         return terms;
     }
 
+    static void combine(Terms &terms, detail::Budget &budget) {
+        std::sort(terms.begin(), terms.end(), [&](const auto &a, const auto &b) {
+            budget.checkpoint(1);
+            return a.first < b.first;
+        });
+        std::size_t out = 0;
+        for (std::size_t begin = 0; begin < terms.size();) {
+            const int j = terms[begin].first;
+            long double value = 0;
+            do {
+                budget.checkpoint(1);
+                value += terms[begin++].second;
+            } while (begin < terms.size() && terms[begin].first == j);
+            if (value != 0) terms[out++] = {j, double(value)};
+        }
+        terms.resize(out);
+    }
+
+    struct Substitution {
+        int variable;
+        double offset;
+        Terms terms;
+    };
+    // q*x + a*y = b から x = (b-a*y)/q を代入する。x の上下限も行として残す。
+    // 目的係数が0の連続変数、または整数等式の係数±1の整数変数を選ぶ。
+    // 後者は整数格子を保つ。
+    std::vector<Substitution> substitute(detail::Prepared &p, detail::Budget &budget) const {
+        std::vector<Substitution> eliminated;
+        // 代入の連鎖で復元式だけが二次規模に膨らむことも避ける。
+        // 未展開の参照数を保守的に伝播し、式の総項数の増加を4n以内に抑える。
+        auto references = budget.filled<std::uint64_t>(p.vars.size(), 1);
+        std::uint64_t growth = 0;
+        const std::uint64_t growth_limit = 4 * std::uint64_t(p.vars.size());
+        for (std::size_t i = 0; i + 1 < p.rows.size(); ++i) {
+            budget.checkpoint(1);
+            const auto &first = p.rows[i];
+            const auto &second = p.rows[i + 1];
+            if (first.terms.size() < 2 ||
+                first.terms.size() > (budget.opt.advanced_presolve ? 16U : 4U) ||
+                first.terms.size() != second.terms.size() || first.rhs != -second.rhs)
+                continue;
+            bool equal = true;
+            bool lattice = budget.opt.advanced_presolve && budget.opt.integer_substitution &&
+                           first.rhs == std::round(first.rhs) && std::abs(first.rhs) <= 1e12;
+            for (auto [j, a] : first.terms)
+                lattice = lattice && p.vars[j].type != VarType::Continuous && a == std::round(a) &&
+                          std::abs(a) <= 1e9;
+            double largest = 0, pivot = 0;
+            int variable = -1;
+            for (std::size_t k = 0; k < first.terms.size(); ++k) {
+                const auto [j, a] = first.terms[k];
+                equal = equal && j == second.terms[k].first && a == -second.terms[k].second;
+                largest = std::max(largest, std::abs(a));
+                if ((vars_[j].type == VarType::Continuous ||
+                     p.vars[j].type == VarType::Continuous || (lattice && std::abs(a) == 1)) &&
+                    objective_[j] == 0 && p.vars[j].lower != p.vars[j].upper &&
+                    (variable < 0 || std::abs(a) > std::abs(pivot))) {
+                    variable = j;
+                    pivot = a;
+                }
+            }
+            if (!equal || variable < 0 || std::abs(pivot) < largest * 1e-6) continue;
+            Substitution rule{variable, first.rhs / pivot, {}};
+            for (auto [j, a] : first.terms)
+                if (j != variable) rule.terms.emplace_back(j, -a / pivot);
+            if (!std::isfinite(rule.offset)) continue;
+            const auto added = references[variable] * (rule.terms.size() - 1);
+            if (added > growth_limit - growth) continue;
+            std::vector<std::pair<std::size_t, detail::Row>> replacements;
+            bool valid = true;
+            // 生成する係数をすべて確認してから適用。途中の時間切れでは結果を使わない。
+            for (std::size_t k = 0; k < p.rows.size(); ++k) {
+                budget.checkpoint(1);
+                if (k == i || k == i + 1) continue;
+                const auto &row = p.rows[k];
+                const auto pos = std::lower_bound(row.terms.begin(), row.terms.end(), variable,
+                                                  [](const auto &t, int j) { return t.first < j; });
+                if (pos == row.terms.end() || pos->first != variable) continue;
+                if (replacements.size() >= 128) {
+                    valid = false;
+                    break;
+                } // fill-in の上限。
+                const double factor = pos->second;
+                detail::Row next{budget.copy(row.terms),
+                                 double((long double)row.rhs - (long double)factor * rule.offset)};
+                next.terms.erase(next.terms.begin() + (pos - row.terms.begin()));
+                for (auto [j, a] : rule.terms) next.terms.emplace_back(j, factor * a);
+                combine(next.terms, budget);
+                if (!std::isfinite(next.rhs)) valid = false;
+                for (auto t : next.terms)
+                    if (!std::isfinite(t.second)) valid = false;
+                if (!valid) break;
+                replacements.emplace_back(k, std::move(next));
+            }
+            const auto &v = p.vars[variable];
+            detail::Row lower, upper;
+            lower.rhs = upper.rhs = 0;
+            if (std::isfinite(v.lower)) {
+                lower.rhs = rule.offset - v.lower;
+                for (auto [j, a] : rule.terms) lower.terms.emplace_back(j, -a);
+            }
+            if (std::isfinite(v.upper)) {
+                upper.rhs = v.upper - rule.offset;
+                upper.terms = rule.terms;
+            }
+            if (!valid || !std::isfinite(lower.rhs) || !std::isfinite(upper.rhs)) continue;
+            // 新しく対象を広げる等式では、変数数だけでなく非ゼロ数も減る場合に限る。
+            // 特に疎なLPを密にするfill-inを防ぐ。従来の短いゼロ目的の消去は維持。
+            if (budget.opt.advanced_presolve &&
+                (first.terms.size() > 4 || vars_[variable].type != VarType::Continuous)) {
+                std::size_t before = first.terms.size() + second.terms.size(),
+                            after = lower.terms.size() + upper.terms.size();
+                for (const auto &replacement : replacements) {
+                    before += p.rows[replacement.first].terms.size();
+                    after += replacement.second.terms.size();
+                }
+                if (after > before) continue;
+            }
+            for (auto &replacement : replacements)
+                p.rows[replacement.first] = std::move(replacement.second);
+            p.rows[i] = std::move(lower);
+            p.rows[i + 1] = std::move(upper);
+            growth += added;
+            for (auto term : rule.terms) references[term.first] += references[variable];
+            eliminated.push_back(std::move(rule));
+            ++budget.stats.substituted_variables;
+            ++i;
+        }
+        return eliminated;
+    }
+
     detail::Prepared prepare(detail::Budget &budget, bool relax) const {
         const auto &opt = budget.opt;
+        const double started = budget.elapsed();
+        struct Timing {
+            detail::Budget &budget;
+            double start;
+            ~Timing() { budget.stats.presolve_seconds += budget.elapsed() - start; }
+        } timing{budget, started};
         detail::Prepared p;
         p.vars = budget.copy(vars_);
         if (!budget.timed)
@@ -830,6 +2905,7 @@ class Model {
                 p.rows.push_back({budget.copy(r.terms), r.rhs});
             }
         }
+        bool has_integer = false, has_continuous = false;
         for (auto &v : p.vars) {
             budget.checkpoint(1);
             if (relax) v.type = VarType::Continuous;
@@ -840,6 +2916,53 @@ class Model {
             if (v.lower > v.upper) {
                 p.infeasible = true;
                 return p;
+            }
+            has_integer |= v.type != VarType::Continuous;
+            has_continuous |= v.type == VarType::Continuous;
+        }
+        if (opt.presolve && opt.advanced_presolve && has_integer && has_continuous) {
+            // 整数の右辺・整数変数と係数±1で結ばれた連続変数は、既に整数。
+            // 等式の両向きが厳密に一致する場合だけ使い、LP緩和には適用しない。
+            for (int pass = 0; pass < 8; ++pass) {
+                bool changed = false;
+                for (std::size_t i = 0; i + 1 < p.rows.size(); ++i) {
+                    budget.checkpoint(1);
+                    const auto &a = p.rows[i];
+                    const auto &b = p.rows[i + 1];
+                    if (a.terms.empty() || a.terms.size() != b.terms.size() || a.rhs != -b.rhs ||
+                        a.rhs != std::round(a.rhs) || std::abs(a.rhs) > 1e12)
+                        continue;
+                    bool valid = true;
+                    int variable = -1;
+                    for (std::size_t k = 0; k < a.terms.size(); ++k) {
+                        budget.checkpoint(1);
+                        auto [j, c] = a.terms[k];
+                        if (j != b.terms[k].first || c != -b.terms[k].second ||
+                            c != std::round(c) || std::abs(c) > 1e9) {
+                            valid = false;
+                            break;
+                        }
+                        if (p.vars[j].type == VarType::Continuous) {
+                            if (variable >= 0 || std::abs(c) != 1) {
+                                valid = false;
+                                break;
+                            }
+                            variable = j;
+                        }
+                    }
+                    if (!valid || variable < 0) continue;
+                    auto &v = p.vars[variable];
+                    v.type = VarType::Integer;
+                    v.lower = detail::bound_round(v.lower, true, opt.integrality_tolerance);
+                    v.upper = detail::bound_round(v.upper, false, opt.integrality_tolerance);
+                    ++budget.stats.implied_integers;
+                    changed = true;
+                    if (v.lower > v.upper) {
+                        p.infeasible = true;
+                        return p;
+                    }
+                }
+                if (!changed) break;
             }
         }
         if (opt.presolve) {
@@ -864,11 +2987,66 @@ class Model {
                     });
                 }
             }
-            if (!detail::propagate(p.rows, p.vars, budget)) {
+            if (opt.advanced_presolve) {
+                detail::Propagation propagation(p.rows, p.vars.size(), budget);
+                auto work = 16 * propagation.size;
+                if (!propagation.run(p.vars, budget, work)) {
+                    p.infeasible = true;
+                    return p;
+                }
+                for (int pass = 0; has_integer && pass < 3; ++pass) {
+                    if (!detail::strengthen(p.rows, p.vars, budget)) break;
+                    work = 8 * propagation.size;
+                    if (!propagation.run(p.vars, budget, work)) {
+                        p.infeasible = true;
+                        return p;
+                    }
+                }
+                budget.stats.presolve_bound_changes += propagation.changes;
+                if (opt.probing && has_integer &&
+                    !detail::probe(propagation, p.rows, p.vars, budget)) {
+                    p.infeasible = true;
+                    return p;
+                }
+                const auto before_final = propagation.changes;
+                if (has_integer && detail::strengthen(p.rows, p.vars, budget)) {
+                    work = 8 * propagation.size;
+                    if (!propagation.run(p.vars, budget, work)) {
+                        p.infeasible = true;
+                        return p;
+                    }
+                }
+                budget.stats.presolve_bound_changes += propagation.changes - before_final;
+            } else if (!detail::propagate(p.rows, p.vars, budget)) {
                 p.infeasible = true;
                 return p;
             }
+            bool fixed = false;
+            for (const auto &v : p.vars) {
+                budget.checkpoint(1);
+                fixed |= v.lower == v.upper;
+            }
+            if (opt.advanced_presolve && (fixed || budget.stats.strengthened_coefficients))
+                for (int pass = 0; pass < 3; ++pass) {
+                    if (!detail::remove_fixed_terms(p.rows, p.vars, budget)) break;
+                    detail::Propagation propagation(p.rows, p.vars.size(), budget);
+                    auto work = 8 * propagation.size;
+                    if (!propagation.run(p.vars, budget, work)) {
+                        p.infeasible = true;
+                        return p;
+                    }
+                    budget.stats.presolve_bound_changes += propagation.changes;
+                }
         }
+        std::vector<Substitution> substitutions;
+        if (opt.presolve && opt.equality_substitution) substitutions = substitute(p, budget);
+        p.substitutions = int(substitutions.size());
+        if (!substitutions.empty() && !detail::propagate(p.rows, p.vars, budget)) {
+            p.infeasible = true;
+            return p;
+        }
+        auto removed = budget.filled<unsigned char>(vars_.size());
+        for (const auto &rule : substitutions) removed[rule.variable] = 1;
         p.map = budget.filled<detail::Mapping>(vars_.size());
         p.c.reserve(vars_.size());
         p.a.reserve(p.rows.size() + p.vars.size());
@@ -881,6 +3059,7 @@ class Model {
         };
         for (int j = 0; j < int(vars_.size()); ++j) {
             budget.checkpoint(1);
+            if (removed[j]) continue;
             const auto &v = p.vars[j];
             if (v.lower == v.upper)
                 p.map[j].offset = v.lower;
@@ -896,6 +3075,23 @@ class Model {
             }
             p.offset += sign * objective_[j] * p.map[j].offset;
         }
+        // 逆順に合成すると、復元式と追加制約の変換は残った列だけで表せる。
+        for (auto it = substitutions.rbegin(); it != substitutions.rend(); ++it) {
+            auto &map = p.map[it->variable];
+            map.offset = it->offset;
+            Terms expression;
+            for (auto [j, a] : it->terms) {
+                budget.checkpoint(1);
+                map.offset += a * p.map[j].offset;
+                for (auto [k, b] : p.map[j].terms) {
+                    budget.checkpoint(1);
+                    expression.emplace_back(k, a * b);
+                }
+            }
+            combine(expression, budget);
+            map.terms.assign(std::move(expression));
+        }
+        std::unordered_map<std::size_t, std::vector<int>> identical;
         auto append = [&](Terms a, double b) {
             double largest = 0;
             budget.chunks(a.size(), [&](std::size_t begin, std::size_t end) {
@@ -916,6 +3112,29 @@ class Model {
                 });
                 b *= scale;
             }
+            if (opt.presolve && opt.advanced_presolve) {
+                std::size_t hash = a.size();
+                for (auto [j, v] : a) {
+                    budget.checkpoint(1);
+                    hash ^= std::hash<double>{}(v) + std::size_t(j) + 0x9e3779b9U + (hash << 6) +
+                            (hash >> 2);
+                }
+                auto &bucket = identical[hash];
+                for (int i : bucket) {
+                    bool equal = p.a[i].size() == a.size();
+                    for (std::size_t k = 0; equal && k < a.size(); ++k) {
+                        budget.checkpoint(1);
+                        equal = p.a[i][k] == a[k];
+                    }
+                    if (equal) {
+                        p.b[i] = std::min(p.b[i], b);
+                        ++budget.stats.duplicate_rows;
+                        return;
+                    }
+                }
+                bucket.push_back(int(p.b.size()));
+            }
+            budget.stats.presolved_nonzeros += a.size();
             p.a.push_terms(std::move(a));
             p.b.push_back(b);
         };
@@ -964,15 +3183,24 @@ class Model {
                     }
                 });
             }
+        if (opt.bounded_variables) p.upper = budget.filled<double>(p.c.size(), inf);
+        bool finite_upper = false;
         for (int j = 0; j < int(p.vars.size()); ++j) {
             budget.checkpoint(1);
+            if (removed[j]) continue;
             const auto &v = p.vars[j];
             if (v.lower == v.upper || !std::isfinite(v.lower) || !std::isfinite(v.upper)) continue;
             if (implied_upper[p.map[j].terms[0].first] <= v.upper - v.lower) continue;
+            if (opt.bounded_variables) {
+                p.upper[p.map[j].terms[0].first] = v.upper - v.lower;
+                finite_upper = true;
+                continue;
+            }
             Terms a;
             a.emplace_back(p.map[j].terms[0].first, 1);
             append(std::move(a), v.upper - v.lower);
         }
+        if (!finite_upper) p.upper.clear();
         return p;
     }
 
@@ -1010,6 +3238,8 @@ class Model {
                         a.emplace_back(column, coef * multiplier);
                 }
             });
+            // 消去した変数と残った変数が同じ列を参照する場合は係数を加算する。
+            if (p.substitutions) combine(a, budget);
             double largest = 0;
             budget.chunks(a.size(), [&](std::size_t begin, std::size_t end) {
                 for (auto j = begin; j < end; ++j)
@@ -1054,8 +3284,14 @@ class Model {
         next->rows = rows_.size();
         const auto &o = budget.opt;
         next->presolve = o.presolve;
+        next->substitution = o.equality_substitution;
+        next->advanced = o.advanced_presolve;
+        next->probing = o.probing;
+        next->integer_substitution = o.integer_substitution;
         next->scaling = o.scaling;
         next->dualize = o.dualize;
+        next->bounded = o.bounded_variables;
+        next->sparse_mode = o.sparse_tableau;
         next->relax = relax;
         next->feasibility = o.feasibility_tolerance;
         next->integrality = o.integrality_tolerance;
@@ -1078,8 +3314,7 @@ class Model {
         for (int j = 0; j < int(x.size()); ++j) {
             x[j] = p.map[j].offset;
             for (auto [k, a] : p.map[j].terms) {
-                const int pos = tab.location[k];
-                const double y = pos < 0 ? tab.row(-pos - 1)[tab.n + 1] : 0;
+                const double y = tab.coordinate(k);
                 x[j] += a * y;
             }
         }
@@ -1090,6 +3325,65 @@ class Model {
         long double value = constant_;
         for (int j = 0; j < int(x.size()); ++j) value += (long double)objective_[j] * x[j];
         return double(value);
+    }
+
+    // 実行可能な点から目的を改善する方向へ動かす。制約種別は仮定しない。
+    // 列の隣接行だけから許される移動量を求め、その行の活動量だけを更新。
+    // 中断時も x は完成した座標移動の結果なので、元モデルで検査して回収できる。
+    void improve_feasible(std::vector<double> &x, const std::vector<detail::Variable> &vars,
+                          detail::Budget &budget) const {
+        std::vector<Terms> columns(vars.size());
+        auto activity = budget.filled<long double>(rows_.size());
+        for (int i = 0; i < int(rows_.size()); ++i) {
+            budget.chunks(rows_[i].terms.size(), [&](std::size_t begin, std::size_t end) {
+                for (auto k = begin; k < end; ++k) {
+                    const auto [j, a] = rows_[i].terms[k];
+                    activity[i] += (long double)a * x[j];
+                    columns[j].emplace_back(i, a);
+                }
+            });
+        }
+        std::vector<int> order(vars.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            budget.checkpoint(1);
+            const double va = std::abs(objective_[a]), vb = std::abs(objective_[b]);
+            return va == vb ? a < b : va > vb;
+        });
+        const double sign = sense_ == Sense::Maximize ? 1 : -1;
+        for (int pass = 0; pass < 2; ++pass) {
+            bool changed = false;
+            for (int j : order) {
+                budget.checkpoint(1);
+                const double gain = sign * objective_[j];
+                if (gain == 0) continue;
+                const double direction = gain > 0 ? 1 : -1;
+                long double distance = gain > 0 ? vars[j].upper - x[j] : x[j] - vars[j].lower;
+                budget.chunks(columns[j].size(), [&](std::size_t begin, std::size_t end) {
+                    for (auto k = begin; k < end; ++k) {
+                        const auto [i, a] = columns[j][k];
+                        const double effect = direction * a;
+                        if (effect > 0)
+                            distance = std::min(
+                                distance, ((long double)rows_[i].rhs - activity[i]) / effect);
+                    }
+                });
+                if (vars[j].type != VarType::Continuous) distance = std::floor(distance);
+                if (!(distance > 0) || !std::isfinite(double(distance))) continue;
+                const double next = x[j] + direction * double(distance);
+                const double move = next - x[j];
+                if (move == 0) continue;
+                x[j] = next;
+                budget.chunks(columns[j].size(), [&](std::size_t begin, std::size_t end) {
+                    for (auto k = begin; k < end; ++k) {
+                        const auto [i, a] = columns[j][k];
+                        activity[i] += (long double)a * move;
+                    }
+                });
+                changed = true;
+            }
+            if (!changed) break;
+        }
     }
 
     bool
@@ -1190,7 +3484,8 @@ public:
             !std::isfinite(opt.integrality_tolerance) || !std::isfinite(opt.pivot_tolerance) ||
             !std::isfinite(opt.absolute_gap) || !std::isfinite(opt.relative_gap) ||
             opt.strong_branching_candidates < 0 || opt.strong_branching_iterations < 0 ||
-            opt.strong_branching_depth < 0 || opt.root_cut_rounds < -1 || opt.cuts_per_round < 0)
+            opt.strong_branching_depth < 0 || opt.sparse_tableau < -1 || opt.sparse_tableau > 1 ||
+            opt.root_cut_rounds < -1 || opt.cuts_per_round < 0)
             throw std::invalid_argument("invalid solver options");
         Result ret;
         detail::Budget budget{opt, ret.stats};
@@ -1201,10 +3496,17 @@ public:
         double global_bound = inf;
         auto finish = [&](Status status) {
             if (status == Status::Infeasible && ret.has_solution) status = Status::NumericalError;
-            // カットで条件が悪くなった場合は元のモデルへ戻る。暫定解と総予算を継承。
-            if (status == Status::NumericalError && ret.stats.cuts) {
+            // 変換・カット後の数値不整合は元のモデルで再確認。暫定解と総予算を継承。
+            if (status == Status::NumericalError &&
+                ((opt.presolve && opt.advanced_presolve) || ret.stats.cuts ||
+                 (opt.equality_substitution && ret.stats.substituted_variables) ||
+                 (opt.basis_repair && opt.scaling))) {
                 Options retry = opt;
                 retry.root_cut_rounds = 0;
+                retry.advanced_presolve = false;
+                // スケーリング後の絶対許容幅が元の行で増幅する場合は、元の単位で再確認。
+                if (opt.basis_repair && !opt.advanced_presolve) retry.scaling = false;
+                if (ret.stats.substituted_variables) retry.equality_substitution = false;
                 retry.time_limit = std::max(0.0, opt.time_limit - budget.elapsed());
                 retry.iteration_limit =
                     opt.iteration_limit - std::min(opt.iteration_limit, ret.stats.pivots);
@@ -1214,9 +3516,31 @@ public:
                 fresh.stats.nodes += ret.stats.nodes;
                 fresh.stats.pivots += ret.stats.pivots;
                 fresh.stats.strong_branching_pivots += ret.stats.strong_branching_pivots;
+                fresh.stats.bound_flips += ret.stats.bound_flips;
+                fresh.stats.basis_refactorizations += ret.stats.basis_refactorizations;
+                fresh.stats.objective_perturbations += ret.stats.objective_perturbations;
+                fresh.stats.pump_pivots += ret.stats.pump_pivots;
+                fresh.stats.pump_lp_solves += ret.stats.pump_lp_solves;
+                fresh.stats.sparse_pivots += ret.stats.sparse_pivots;
+                fresh.stats.sparse_tableaux += ret.stats.sparse_tableaux;
+                fresh.stats.dense_conversions += ret.stats.dense_conversions;
+                fresh.stats.tableau_evictions += ret.stats.tableau_evictions;
+                fresh.stats.tableau_rebuilds += ret.stats.tableau_rebuilds;
+                fresh.stats.peak_pending_tableau_bytes = std::max(
+                    fresh.stats.peak_pending_tableau_bytes, ret.stats.peak_pending_tableau_bytes);
                 fresh.stats.root_pivots += ret.stats.root_pivots;
                 fresh.stats.reused_root = fresh.stats.reused_root || ret.stats.reused_root;
                 fresh.stats.heuristic_solutions += ret.stats.heuristic_solutions;
+                fresh.stats.diving_pivots += ret.stats.diving_pivots;
+                fresh.stats.diving_lp_solves += ret.stats.diving_lp_solves;
+                fresh.stats.substituted_variables += ret.stats.substituted_variables;
+                fresh.stats.presolve_bound_changes += ret.stats.presolve_bound_changes;
+                fresh.stats.strengthened_coefficients += ret.stats.strengthened_coefficients;
+                fresh.stats.probing_trials += ret.stats.probing_trials;
+                fresh.stats.probing_bound_changes += ret.stats.probing_bound_changes;
+                fresh.stats.duplicate_rows += ret.stats.duplicate_rows;
+                fresh.stats.implied_integers += ret.stats.implied_integers;
+                fresh.stats.presolve_seconds += ret.stats.presolve_seconds;
                 fresh.stats.cuts += ret.stats.cuts;
                 fresh.stats.reduced_cost_fixings += ret.stats.reduced_cost_fixings;
                 fresh.stats.numerical_restarts += ret.stats.numerical_restarts + 1;
@@ -1224,6 +3548,9 @@ public:
                 return fresh;
             }
             ret.status = status;
+            // 不整合のある辞書や実行不能判定から得た境界は証明に使えない。
+            // 元の制約で検査済みの暫定解は保持し、境界だけを未確定に戻す。
+            if (status == Status::NumericalError) global_bound = inf;
             if (ret.has_solution) global_bound = std::max(global_bound, incumbent);
             ret.best_bound = sign * global_bound;
             ret.stats.seconds = budget.elapsed();
@@ -1266,6 +3593,7 @@ public:
                     ret.stats.reused_root = true;
                     global_bound = cached->tableau.value() + cached->prepared.offset;
                     p = cached->prepared.clone(budget);
+                    ret.stats.substituted_variables = p.substitutions;
                     root = cached->tableau.clone(budget);
                     append_to_root(p, root, cached->rows, budget);
                 } else
@@ -1290,6 +3618,17 @@ public:
                         });
                         accept(x, true);
                     }
+                    // 保存済み根からの短い再最適化では、索引作成の固定費を避ける。
+                    if (!reuse && opt.primal_sweeps && vars_.size() >= 128 && ret.has_solution) {
+                        auto x = budget.copy(ret.x);
+                        try {
+                            improve_feasible(x, p.vars, budget);
+                        } catch (const detail::TimeLimitReached &) {
+                            accept(x, true, false);
+                            throw;
+                        }
+                        accept(x, true);
+                    }
                 }
                 ret.stats.presolved_variables = int(p.c.size());
                 ret.stats.presolved_constraints = int(p.b.size());
@@ -1299,24 +3638,22 @@ public:
                         integers.push_back(j);
                 // 多数の非負変数を持つ covering/assignment LP は、双対のほうが小さい
                 // 基底で Phase I も不要になることが多い。MIP は分枝用の主辞書を保持する。
-                if (!reuse && opt.dualize && integers.empty() && !p.b.empty() &&
+                if (!reuse && opt.dualize && p.upper.empty() && integers.empty() && !p.b.empty() &&
                     p.c.size() > 2 * p.b.size() &&
                     std::all_of(p.c.begin(), p.c.end(), [](double c) { return c <= 0; })) {
-                    std::vector<std::vector<double>> a;
-                    a.reserve(p.c.size());
-                    for (std::size_t j = 0; j < p.c.size(); ++j)
-                        a.push_back(budget.filled<double>(p.b.size()));
-                    std::vector<double> b = p.c, c = p.b;
+                    auto a = budget.filled<Terms>(p.c.size());
+                    auto b = budget.copy(p.c), c = budget.copy(p.b);
                     for (double &v : b) v = -v;
                     for (double &v : c) v = -v;
                     for (int i = 0; i < int(p.b.size()); ++i)
                         budget.chunks(p.a[i].size(), [&](std::size_t begin, std::size_t end) {
                             for (auto k = begin; k < end; ++k) {
                                 auto [j, v] = p.a[i][k];
-                                a[j][i] = -v;
+                                a[j].emplace_back(i, -v);
                             }
                         });
                     detail::Tableau dual(a, b, c, &budget);
+                    ret.stats.root_storage_bytes = dual.stored_bytes();
                     ++ret.stats.nodes;
                     const auto before = ret.stats.pivots;
                     const Status s = dual.solve(budget);
@@ -1346,7 +3683,8 @@ public:
                 }
                 if (budget.stop() || ret.stats.nodes >= opt.node_limit)
                     return finish(Status::Limit);
-                if (!reuse) root = detail::Tableau(p.a, p.b, p.c, &budget);
+                if (!reuse) root = detail::Tableau(p.a, p.b, p.c, &budget, p.upper);
+                ret.stats.root_storage_bytes = root.stored_bytes();
                 ++ret.stats.nodes;
                 const auto before = ret.stats.pivots;
                 // 長い再最適化は一度だけ作り直す。総時間・pivot・node の予算は継続。
@@ -1355,7 +3693,7 @@ public:
                                             std::max(256LL, 4LL * (root.n + (long long)root.m))));
                 Status root_status = reuse ? root.dual(budget, soft_limit) : root.solve(budget);
                 ret.stats.root_pivots += ret.stats.pivots - before;
-                if (root_status == Status::Optimal) {
+                for (int repair = 0; repair < 2 && root_status == Status::Optimal; ++repair) {
                     root_x = recover(p, root);
                     const double obj = sign * objective_value(root_x);
                     const double bound = root.value() + p.offset;
@@ -1367,7 +3705,10 @@ public:
                         if (root.nonbasic[j] != -1)
                             valid = std::isfinite(root.row(root.m)[j]) &&
                                     root.row(root.m)[j] >= -10 * opt.pivot_tolerance;
-                    if (!valid) root_status = Status::NumericalError;
+                    if (valid) break;
+                    const auto repair_start = ret.stats.pivots;
+                    root_status = repair == 0 ? root.recover_basis(budget) : Status::NumericalError;
+                    ret.stats.root_pivots += ret.stats.pivots - repair_start;
                 }
                 if (reuse && root_status != Status::Optimal &&
                     (root_status != Status::Limit || !budget.stop())) {
@@ -1460,6 +3801,264 @@ public:
                 }
             }
 
+            detail::Tableau alternative_root;
+            std::vector<double> alternative_point;
+            auto diversify_root = [&] {
+                if (!opt.root_diversification || ret.has_solution || !opt.dual_devex ||
+                    std::uint64_t(p.a.size() + 2) * (p.c.size() + 2) * sizeof(double) >
+                        opt.tableau_cache_limit)
+                    return;
+                Options local = opt;
+                local.dual_devex = false;
+                local.time_limit = std::min(
+                    opt.time_limit, budget.elapsed() + std::min(.02, opt.time_limit * .03));
+                local.iteration_limit =
+                    ret.stats.pivots +
+                    std::min<std::uint64_t>(
+                        4096, opt.iteration_limit - std::min(opt.iteration_limit, ret.stats.pivots));
+                detail::Budget alternate_budget{local, ret.stats, budget.start};
+                const auto before = ret.stats.pivots;
+                try {
+                    detail::Tableau candidate(p.a, p.b, p.c, &alternate_budget, p.upper);
+                    ++ret.stats.diving_lp_solves;
+                    if (candidate.solve(alternate_budget) == Status::Optimal) {
+                        auto point = recover(p, candidate);
+                        if (feasible(point, opt.feasibility_tolerance, true, &alternate_budget)) {
+                            alternative_point = std::move(point);
+                            alternative_root = std::move(candidate);
+                        }
+                    }
+                } catch (const detail::TimeLimitReached &) {}
+                ret.stats.diving_pivots += ret.stats.pivots - before;
+            };
+
+            // 丸め点へのL1距離を最小化するLPと、距離目的での小さな分枝探索。
+            // ヒューリスティックの境界は証明に使わず、元モデルで検査した解だけ採用。
+            auto run_pump = [&] {
+                if (!opt.feasibility_pump || ret.has_solution) return;
+                Options local = opt;
+                local.time_limit = std::min(
+                    opt.time_limit, budget.elapsed() + std::min(.25, opt.time_limit * .25));
+                local.iteration_limit =
+                    ret.stats.pivots +
+                    std::min<std::uint64_t>(
+                        20000,
+                        opt.iteration_limit - std::min(opt.iteration_limit, ret.stats.pivots));
+                detail::Budget pump_budget{local, ret.stats, budget.start};
+                const auto before = ret.stats.pivots;
+                auto account = [&] { ret.stats.pump_pivots += ret.stats.pivots - before; };
+                try {
+                    int solves = 0;
+                    auto x = alternative_point.empty() ? root_x : alternative_point;
+                    std::vector<double> previous;
+                    std::uint32_t random = 123456789;
+                    auto draw = [&] {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        return random / 4294967296.0;
+                    };
+                    for (int round = 0; round < 40 && solves < 256 && !pump_budget.stop(); ++round) {
+                        std::vector<double> target;
+                        target.reserve(integers.size());
+                        for (int j : integers) target.push_back(std::round(x[j]));
+                        bool same = target == previous;
+                        if (same || (round && round % 7 == 0)) {
+                            for (int k = 0; k < int(integers.size()); ++k) {
+                                int j = integers[k];
+                                double f = x[j] - std::floor(x[j]);
+                                if (draw() < .1 + .5 * std::min(f, 1 - f)) {
+                                    double direction = draw() < .5 ? -1 : 1;
+                                    target[k] = std::max(std::ceil(p.vars[j].lower),
+                                                         std::min(std::floor(p.vars[j].upper),
+                                                                  target[k] + direction));
+                                }
+                            }
+                        }
+                        previous = target;
+                        detail::ImmutableRows a;
+                        a.rows = pump_budget.copy(p.a.rows);
+                        auto b = pump_budget.copy(p.b);
+                        auto c = pump_budget.filled<double>(p.c.size());
+                        auto upper = pump_budget.copy(p.upper);
+                        if (upper.empty()) upper.resize(c.size(), inf);
+                        for (int k = 0; k < int(integers.size()); ++k) {
+                            pump_budget.checkpoint(1);
+                            const int j = integers[k];
+                            if (p.map[j].terms.empty()) continue;
+                            double direction = target[k] <= p.vars[j].lower   ? -1
+                                               : target[k] >= p.vars[j].upper ? 1
+                                                                              : 0;
+                            if (direction) {
+                                for (auto [v, coef] : p.map[j].terms) c[v] += direction * coef;
+                            } else {
+                                int t = int(c.size());
+                                c.push_back(-1);
+                                upper.push_back(inf);
+                                for (double sign : {1.0, -1.0}) {
+                                    Terms row;
+                                    for (auto [v, coef] : p.map[j].terms)
+                                        row.emplace_back(v, sign * coef);
+                                    row.emplace_back(t, -1);
+                                    a.push_terms(std::move(row));
+                                    b.push_back(sign * (target[k] - p.map[j].offset));
+                                }
+                            }
+                        }
+                        detail::Tableau tab(a, b, c, &pump_budget, upper);
+                        ++solves;
+                        ++ret.stats.pump_lp_solves;
+                        Status status = tab.solve(pump_budget);
+                        if (status != Status::Optimal) break;
+                        x = recover(p, tab.solution());
+                        if (!feasible(x, opt.feasibility_tolerance, true, &pump_budget)) break;
+                        auto rounded = x;
+                        for (int j : integers) rounded[j] = std::round(rounded[j]);
+                        if (accept(rounded, true)) break;
+                        std::vector<detail::Tableau> stack;
+                        stack.push_back(std::move(tab));
+                        for (int node = 0;
+                             node < 128 && solves < 256 && !stack.empty() && !pump_budget.stop();
+                             ++node) {
+                            auto near = std::move(stack.back());
+                            stack.pop_back();
+                            ++solves;
+                            ++ret.stats.pump_lp_solves;
+                            Status solved = near.dual(pump_budget, 256);
+                            if (solved != Status::Optimal) continue;
+                            auto y = recover(p, near.solution());
+                            int chosen = -1;
+                            double score = 0;
+                            for (int j : integers) {
+                                double f = y[j] - std::floor(y[j]);
+                                if (std::min(f, 1 - f) > std::max(score, opt.integrality_tolerance)) {
+                                    score = std::min(f, 1 - f);
+                                    chosen = j;
+                                }
+                            }
+                            if (chosen < 0) {
+                                for (int j : integers) y[j] = std::round(y[j]);
+                                if (accept(y, true)) {
+                                    account();
+                                    return;
+                                }
+                                continue;
+                            }
+                            if (stack.size() >= 32) continue;
+                            bool up = y[chosen] - std::floor(y[chosen]) >= .5;
+                            auto add = [&](detail::Tableau &t, bool direction) {
+                                double sign = direction ? -1 : 1;
+                                double b = direction ? std::ceil(y[chosen]) : std::floor(y[chosen]);
+                                t.add_constraint(p.map[chosen].terms,
+                                                 sign * (b - p.map[chosen].offset), &pump_budget,
+                                                 sign);
+                            };
+                            auto other = near.clone(pump_budget);
+                            add(other, !up);
+                            add(near, up);
+                            stack.push_back(std::move(other));
+                            stack.push_back(std::move(near));
+                        }
+                    }
+                } catch (const detail::TimeLimitReached &) {}
+                account();
+                budget.checkpoint();
+            };
+
+            // 証明用の根と独立した少数の dive。連続変数は各LPで再調整する。
+            // 総時間・総pivot予算を共有し、局所打切りでは検査済みの解だけ残す。
+            bool dive_pending = (opt.diving_heuristic || opt.feasibility_pump) && !reuse;
+            detail::Tableau dive_root;
+            if (dive_pending && opt.diving_heuristic) dive_root = root.clone(budget);
+            auto run_dive = [&] {
+                dive_pending = false;
+                if (!opt.diving_heuristic) return;
+                // 暫定解が根の境界に近ければ、追加探索より証明側へ予算を残す。
+                const double urgency =
+                    ret.has_solution ? std::min(1.0, 10 * std::max(0.0, global_bound - incumbent) /
+                                                         std::max(1.0, std::abs(incumbent)))
+                                     : 1.0;
+                const double allowance =
+                    std::min(0.08, opt.time_limit * 0.15) * std::max(.05, urgency);
+                Options local;
+                local.dual_devex = opt.dual_devex;
+                local.basis_repair = opt.basis_repair;
+                local.pivot_tolerance = opt.pivot_tolerance;
+                local.time_limit = std::min(opt.time_limit, budget.elapsed() + allowance);
+                local.iteration_limit =
+                    ret.stats.pivots +
+                    std::min<std::uint64_t>(
+                        4096, opt.iteration_limit - std::min(opt.iteration_limit, ret.stats.pivots));
+                detail::Budget dive_budget{local, ret.stats, budget.start};
+                const auto before = ret.stats.pivots;
+                try {
+                    auto down_locks = dive_budget.filled<int>(vars_.size());
+                    auto up_locks = dive_budget.filled<int>(vars_.size());
+                    for (const auto &row : rows_)
+                        for (auto [j, a] : row.terms) {
+                            dive_budget.checkpoint(1);
+                            ++(a > 0 ? up_locks[j] : down_locks[j]);
+                        }
+                    for (int attempt = 0; attempt < 3 && !dive_budget.stop(); ++attempt) {
+                        auto tab = (attempt > 0 && !alternative_point.empty() ? alternative_root
+                                                                              : dive_root)
+                                       .clone(dive_budget);
+                        for (int depth = 0; depth < 512 && !dive_budget.stop(); ++depth) {
+                            auto x = recover(p, tab);
+                            int chosen = -1;
+                            bool up = false;
+                            double best = inf;
+                            for (int j : integers) {
+                                dive_budget.checkpoint(1);
+                                const double f = x[j] - std::floor(x[j]);
+                                if (std::min(f, 1 - f) <= opt.integrality_tolerance) continue;
+                                // 近い整数、制約を壊しにくい方向、目的改善方向の順に試す。
+                                const bool direction = attempt == 0   ? f >= .5
+                                                       : attempt == 1 ? up_locks[j] < down_locks[j]
+                                                                      : sign * objective_[j] > 0;
+                                const double score =
+                                    (direction ? 1 - f : f) *
+                                    (attempt == 1 ? 1 + (direction ? up_locks[j] : down_locks[j])
+                                                  : 1);
+                                if (score < best) {
+                                    best = score;
+                                    chosen = j;
+                                    up = direction;
+                                }
+                            }
+                            if (chosen < 0) {
+                                for (int j : integers) x[j] = std::round(x[j]);
+                                accept(x, true);
+                                break;
+                            }
+                            auto previous = tab.clone(dive_budget);
+                            auto branch = [&](bool direction) {
+                                const double multiplier = direction ? -1 : 1;
+                                const double bound =
+                                    direction ? std::ceil(x[chosen]) : std::floor(x[chosen]);
+                                tab.add_constraint(p.map[chosen].terms,
+                                                   multiplier * (bound - p.map[chosen].offset),
+                                                   &dive_budget, multiplier);
+                                ++ret.stats.diving_lp_solves;
+                                return tab.dual(dive_budget, 256);
+                            };
+                            Status status = branch(up);
+                            if (status == Status::Infeasible) {
+                                tab = std::move(previous);
+                                status = branch(!up);
+                            }
+                            if (status != Status::Optimal) break;
+                            if (ret.has_solution &&
+                                tab.value() + p.offset <= incumbent + opt.absolute_gap)
+                                break;
+                        }
+                    }
+                } catch (const detail::TimeLimitReached &) {}
+                ret.stats.diving_pivots += ret.stats.pivots - before;
+                dive_root = detail::Tableau{};
+                budget.checkpoint();
+            };
+
             std::vector<bool> integer_column(p.c.size(), false);
             for (int j : integers)
                 if (p.map[j].terms.size() == 1 && p.map[j].offset == std::round(p.map[j].offset))
@@ -1551,18 +4150,49 @@ public:
                         root.fix_nonbasic(step, global_bound - improvement_target(), budget);
             }
 
+            struct BranchPath {
+                std::shared_ptr<const BranchPath> parent;
+                int variable;
+                bool up;
+                double bound;
+            };
             struct Node {
                 detail::Tableau tab;
-                std::vector<detail::Row> branches;
+                std::shared_ptr<const BranchPath> path;
                 double bound;
                 int depth;
                 bool solved;
                 int branch_var = -1;
                 bool up = false;
                 double distance = 0, parent_bound = 0;
+                std::uint64_t bytes = 0;
             };
+            auto tableau_bytes = [](const detail::Tableau &tab) {
+                // 共有行も全て数える保守的な値。辞書を復元可能なキャッシュとして扱う。
+                return tab.stored_bytes();
+            };
+            auto replay_root = root.clone(budget);
             std::vector<Node> pending;
             pending.push_back({std::move(root), {}, global_bound, 0, true});
+            pending.back().bytes = tableau_bytes(pending.back().tab);
+            std::uint64_t pending_bytes = pending.back().bytes;
+            std::size_t oldest_resident = 0;
+            auto trim_cache = [&] {
+                while (pending_bytes > opt.tableau_cache_limit && oldest_resident < pending.size()) {
+                    budget.checkpoint();
+                    auto &old = pending[oldest_resident++];
+                    if (!old.bytes) continue;
+                    pending_bytes -= old.bytes;
+                    old.bytes = 0;
+                    old.tab = detail::Tableau{};
+                    if (old.solved)
+                        old.branch_var = -1; // 既に更新した擬似コストを二重計上しない。
+                    old.solved = false;
+                    ++ret.stats.tableau_evictions;
+                }
+                ret.stats.peak_pending_tableau_bytes =
+                    std::max(ret.stats.peak_pending_tableau_bytes, pending_bytes);
+            };
             struct Pseudo {
                 double down = 0, up = 0;
                 int nd = 0, nu = 0;
@@ -1580,14 +4210,29 @@ public:
                 ++(up ? v.nu : v.nd);
             };
             std::vector<std::pair<double, int>> candidates;
+            trim_cache();
+            const auto search_start = ret.stats.pivots;
             while (!pending.empty()) {
                 global_bound = incumbent;
                 for (const auto &node : pending)
                     global_bound = std::max(global_bound, tighten(node.bound));
                 if (prunable(global_bound)) return finish(Status::Optimal);
                 if (budget.stop()) return finish(Status::Limit);
+                // 容易なMIPは先に通常の探索で解く。ノード予算が尽きる前には試行する。
+                if (dive_pending && (ret.stats.pivots - search_start >= 4096 ||
+                                     ret.stats.nodes >= opt.node_limit)) {
+                    diversify_root();
+                    run_dive();
+                    run_pump();
+                    alternative_root = detail::Tableau{};
+                    alternative_point.clear();
+                    if (prunable(global_bound)) return finish(Status::Optimal);
+                    if (budget.stop()) return finish(Status::Limit);
+                }
                 Node node = std::move(pending.back());
                 pending.pop_back();
+                pending_bytes -= node.bytes;
+                oldest_resident = std::min(oldest_resident, pending.size());
                 if (prunable(node.bound)) continue;
                 if (node.depth) {
                     if (ret.stats.nodes >= opt.node_limit) return finish(Status::Limit);
@@ -1595,37 +4240,53 @@ public:
                 }
                 if (!node.solved) {
                     Status s;
-                    if (opt.warm_start)
-                        s = node.tab.dual(budget);
-                    else {
-                        node.tab = detail::Tableau(p.a, p.b, p.c, &budget);
-                        // コールド比較用: 分枝行を元の非基底辞書に追加し Phase I から解く。
-                        for (const auto &b : node.branches) {
-                            int j = b.terms[0].first;
-                            bool up = b.terms[0].second < 0;
-                            add_branch(node.tab, j, up, up ? -b.rhs : b.rhs);
-                            node.tab.write_row(node.tab.m - 1)[node.tab.n] = -1;
+                    if (!opt.warm_start || !node.bytes) {
+                        node.tab = opt.warm_start
+                                       ? replay_root.clone(budget)
+                                       : detail::Tableau(p.a, p.b, p.c, &budget, p.upper);
+                        std::vector<const BranchPath *> path;
+                        for (auto b = node.path.get(); b; b = b->parent.get()) {
+                            budget.checkpoint(1);
+                            path.push_back(b);
                         }
-                        s = node.tab.solve(budget);
+                        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                            const auto &b = **it;
+                            add_branch(node.tab, b.variable, b.up, b.bound);
+                            if (!opt.warm_start)
+                                node.tab.write_row(node.tab.m - 1)[node.tab.n] = -1;
+                        }
+                        ++ret.stats.tableau_rebuilds;
                     }
+                    s = opt.warm_start ? node.tab.dual(budget) : node.tab.solve(budget);
                     if (s == Status::Infeasible) continue;
+                    if (s == Status::Unbounded) return finish(Status::NumericalError);
                     if (s != Status::Optimal) return finish(s);
-                    node.bound = node.tab.value() + p.offset;
+                    node.bound = std::min(node.bound, node.tab.value() + p.offset);
                     if (node.branch_var >= 0)
                         update_pc(node.branch_var, node.up, node.distance,
                                   node.parent_bound - node.bound);
-                    if (prunable(node.bound)) continue;
                 }
                 auto x = recover(p, node.tab);
-                if (!is_feasible(x, opt.feasibility_tolerance, true))
-                    return finish(Status::NumericalError);
+                if (!feasible(x, opt.feasibility_tolerance, true, &budget)) {
+                    const Status recovered = node.tab.recover_basis(budget);
+                    if (recovered == Status::Infeasible) continue;
+                    if (recovered == Status::Unbounded) return finish(Status::NumericalError);
+                    if (recovered != Status::Optimal) return finish(recovered);
+                    x = recover(p, node.tab);
+                    if (!feasible(x, opt.feasibility_tolerance, true, &budget))
+                        return finish(Status::NumericalError);
+                    node.bound =
+                        std::min(node.depth ? node.parent_bound : inf, node.tab.value() + p.offset);
+                }
                 if (opt.rounding_heuristic) round_candidate(x);
                 if (prunable(node.bound)) continue;
                 if (opt.reduced_cost_fixing && ret.has_solution && node.depth) {
                     step.resize(node.tab.next_id, 1);
-                    ret.stats.reduced_cost_fixings +=
-                        node.tab.fix_nonbasic(step, node.bound - improvement_target(), budget,
-                                              std::max(4, node.tab.n / 8));
+                    // 再構築した辞書には祖先の列固定を戻さない。保存済みの node.bound が
+                    // より強くても、reduced cost は現在の辞書の目的値と組にして使う。
+                    ret.stats.reduced_cost_fixings += node.tab.fix_nonbasic(
+                        step, node.tab.value() + p.offset - improvement_target(), budget,
+                        std::max(4, node.tab.n / 8));
                 }
                 candidates.clear();
                 for (int j : integers) {
@@ -1665,10 +4326,26 @@ public:
                     add_branch(down, j, false, std::floor(x[j]));
                     add_branch(up, j, true, std::ceil(x[j]));
                     auto before = ret.stats.pivots;
-                    auto ds = down.dual(budget, opt.strong_branching_iterations);
-                    auto us = up.dual(budget, opt.strong_branching_iterations);
+                    auto checked_probe = [&](detail::Tableau &tab) {
+                        const auto start = ret.stats.pivots;
+                        Status result = tab.dual(budget, opt.strong_branching_iterations);
+                        if (result == Status::Optimal &&
+                            !feasible(recover(p, tab), opt.feasibility_tolerance, true, &budget)) {
+                            const int left = std::max(
+                                0, opt.strong_branching_iterations - int(ret.stats.pivots - start));
+                            result = tab.recover_basis(budget, left);
+                        }
+                        return result == Status::Unbounded ? Status::NumericalError : result;
+                    };
+                    auto ds = checked_probe(down);
+                    auto us = checked_probe(up);
                     ret.stats.strong_branching_pivots += ret.stats.pivots - before;
                     if (budget.stop()) return finish(Status::Limit);
+                    if ((ds == Status::Optimal &&
+                         !feasible(recover(p, down), opt.feasibility_tolerance, true, &budget)) ||
+                        (us == Status::Optimal &&
+                         !feasible(recover(p, up), opt.feasibility_tolerance, true, &budget)))
+                        return finish(Status::NumericalError);
                     if (ds == Status::NumericalError || us == Status::NumericalError)
                         return finish(Status::NumericalError);
                     double dg = ds == Status::Infeasible
@@ -1704,18 +4381,19 @@ public:
                 }
                 auto push = [&](detail::Tableau tab, bool up, Status s) {
                     if (s == Status::Infeasible) return;
-                    double b = std::min(node.bound, tab.value() + p.offset);
+                    double b = node.bound;
+                    if (tab.dual_feasible(10 * opt.pivot_tolerance))
+                        b = std::min(b, tab.value() + p.offset);
                     if (prunable(b)) return;
-                    std::vector<detail::Row> branches;
-                    if (!opt.warm_start) {
-                        branches = node.branches;
-                        branches.push_back({{{branch, up ? -1.0 : 1.0}},
-                                            up ? -std::ceil(x[branch]) : std::floor(x[branch])});
-                    }
+                    auto path = std::make_shared<BranchPath>(BranchPath{
+                        node.path, branch, up, up ? std::ceil(x[branch]) : std::floor(x[branch])});
                     const double distance =
                         up ? std::ceil(x[branch]) - x[branch] : x[branch] - std::floor(x[branch]);
-                    pending.push_back({std::move(tab), std::move(branches), b, node.depth + 1,
-                                       s == Status::Optimal, branch, up, distance, node.bound});
+                    const auto bytes = tableau_bytes(tab);
+                    pending_bytes += bytes;
+                    pending.push_back({std::move(tab), std::move(path), b, node.depth + 1,
+                                       s == Status::Optimal, branch, up, distance, node.bound,
+                                       bytes});
                 };
                 // 有望な側を先に深さ優先探索し、暫定解を早めに得る。
                 bool up_first = best_up.value() > best_down.value();
@@ -1726,6 +4404,7 @@ public:
                     push(std::move(best_up), true, up_status);
                     push(std::move(best_down), false, down_status);
                 }
+                trim_cache();
             }
             global_bound = incumbent;
             return finish(ret.has_solution ? Status::Optimal : Status::Infeasible);
@@ -1776,6 +4455,7 @@ public:
         check_coefficients(c);
         c_ = std::move(c);
         if (state_ == State::Optimal || state_ == State::Primal) {
+            tab_.source_cost = std::make_shared<const std::vector<double>>(c_);
             tab_.scale_objective(c_);
             double *z = tab_.write_row(tab_.m);
             std::fill(z, z + tab_.stride, 0);
@@ -1797,13 +4477,14 @@ public:
     Result solve(const Options &opt = {}) {
         if (!(opt.time_limit >= 0) || !(opt.feasibility_tolerance > 0) ||
             !(opt.pivot_tolerance > 0) || !std::isfinite(opt.feasibility_tolerance) ||
-            !std::isfinite(opt.pivot_tolerance))
+            !std::isfinite(opt.pivot_tolerance) || opt.sparse_tableau < -1 || opt.sparse_tableau > 1)
             throw std::invalid_argument("invalid LP options");
         Result r;
         r.best_bound = inf;
         r.stats.original_variables = r.stats.presolved_variables = int(c_.size());
         r.stats.original_constraints = r.stats.presolved_constraints = int(b_.size());
         detail::Budget budget{opt, r.stats};
+        if (state_ != State::Cold) r.stats.root_storage_bytes = tab_.stored_bytes();
         try {
             if (budget.stop() || opt.node_limit == 0)
                 r.status = Status::Limit;
@@ -1811,6 +4492,7 @@ public:
                 ++r.stats.nodes;
                 if (state_ == State::Cold) {
                     tab_ = detail::Tableau(a_, b_, c_, &budget);
+                    r.stats.root_storage_bytes = tab_.stored_bytes();
                     state_ = State::Primal;
                     r.status = tab_.solve(budget);
                 } else if (state_ == State::Dual)

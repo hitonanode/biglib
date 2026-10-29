@@ -1,13 +1,14 @@
 # biglib
 
 C++17 以降に対応する、標準ライブラリだけで利用可能な C++ ヘッダーオンリーライブラリ。
-最大重みマッチングとシュタイナー木は整数の総重み・費用に `__int128` を使うため、GCC / Clang が対象。
+最大重みマッチング・シュタイナー木・整数制約ヒューリスティックは整数計算に `__int128` を使うため、GCC / Clang が対象。
 
 ## ライブラリ一覧
 
 | 分野 | ヘッダー | ドキュメント |
 | --- | --- | --- |
 | 線形計画・混合整数計画問題 | [mip.hpp](mip/mip.hpp) | [使い方](mip/README.md) |
+| 整数・大域制約ヒューリスティック | [constraint_search.hpp](constraint_search/constraint_search.hpp) | [使い方](constraint_search/README.md) |
 | 一般化割当問題 | [generalized_assignment.hpp](generalized_assignment/generalized_assignment.hpp) | [使い方](generalized_assignment/README.md) |
 | 対称巡回セールスマン問題 | [symmetric_tsp.hpp](symmetric_tsp/symmetric_tsp.hpp) | [使い方](symmetric_tsp/README.md) |
 | 非対称巡回セールスマン問題 | [asymmetric_tsp.hpp](asymmetric_tsp/asymmetric_tsp.hpp) | [使い方](asymmetric_tsp/README.md) |
